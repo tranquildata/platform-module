@@ -53,7 +53,7 @@ This definition says that your module can be invoked with the directive `monteca
 
 The container that you build with this project will be started on-demand when customer API calls to the Data Platform ask to run this module. When a container instance is started, it is given a single directive as an environment variable. A simple API front-end server (see the `api` directory) is started, and it listens for input to provide the appropriate IO pattern expected by the module code. The API service keeps the module implementation both cloud and platform neutral, and isolated from policy, security, storage, audit, etc.
 
-You can test that you've built your module container correctly by runnig it and providing input via API. For instance, if you build the vanilla contaier by checking out this repository and simply running step 4 above, you can then run:
+You can test that you've built your module container correctly by running it and providing input via API. For instance, if you build the vanilla container by checking out this repository and simply running step 4 above, you can then run:
 
 ```bash
 docker run -e MODULE_DIRECTIVE=hello -p 8080:80 "tranquildata/platform-module" start
@@ -61,4 +61,4 @@ docker run -e MODULE_DIRECTIVE=hello -p 8080:80 "tranquildata/platform-module" s
 
 You now have a container instance running with the local port `8080` accessible. You can test this by running `curl -I "http://localhost:8080"` and you should see `HTTP/1.1 200 OK`.
 
-To give the module input, run `curl -X PUT "http://localhost:8080" -d 'alice'`. The module will process the input "alice" and return the value "hello alice" that is base64-encoded before being returned to the API caller. Because this is a batch-mode module directive, as soon as the return value is provided the module terminates, then the API server shuts down and the container instance exists. 
+To give the module input, run `curl -X PUT "http://localhost:8080" -d 'alice'`. The module will process the input "alice" and return the value "hello alice" that is base64-encoded before being returned to the API caller. Because this is a batch-mode module directive, as soon as the return value is provided the module terminates, then the API server shuts down and the container instance exits. 
