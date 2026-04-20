@@ -182,7 +182,7 @@ func (apis *APIService) handleFullOutput() (map[string][]byte, error) {
 		} else {
 			for _, entry := range files {
 				if !entry.IsDir() {
-					if fileBytes, err := os.ReadFile(entry.Name()); err == nil {
+					if fileBytes, err := os.ReadFile(fmt.Sprintf("%s/%s", OutputDirectoryPath, entry.Name())); err == nil {
 						outputMap[entry.Name()] = fileBytes
 					}
 				}
