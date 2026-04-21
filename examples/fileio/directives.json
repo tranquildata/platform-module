@@ -1,0 +1,8 @@
+[
+    {
+        "name": "multifile",
+        "batch": {
+            "files": true
+        }
+    }
+]
