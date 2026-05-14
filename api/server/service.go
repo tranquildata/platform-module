@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"time"
 
 	"github.com/tranquildata/platform-module/config"
@@ -45,6 +46,19 @@ func Setup(runtimeConfig *config.RuntimeConfig, batch bool, fileIO bool) *APISer
 	}
 }
 
+type panicWrapper struct {
+	handler http.Handler
+}
+
+func (pw *panicWrapper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("panicWrapper ServeHTTP Recovered from a panic: %v, stack: %v\n", r, string(debug.Stack()))
+		}
+	}()
+	pw.handler.ServeHTTP(w, r)
+}
+
 // Serve attempts to open the given port, initializes API endpoints, and
 // blocks until either module startup fails or a module successfully runs
 // to completion. Typically, this is used as the sustaining endpoint. If
@@ -54,9 +68,12 @@ func (apis *APIService) Serve(port uint16) error {
 	// setup and serve the HTTP API endpoint
 	mux := http.NewServeMux()
 	apis.registerHTTPEndpoints(mux)
+	pw := &panicWrapper{
+		handler: mux,
+	}
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
-		Handler: mux,
+		Handler: pw,
 	}
 	go httpServer.ListenAndServe()
 
@@ -110,6 +127,8 @@ func (apis *APIService) inputData(w http.ResponseWriter, r *http.Request) {
 	// always trigger shutdown, but that will need to be re-visited when we add
 	// support for interactive modules
 	defer func() {
+		//this will shut things down messily. Any buffered I/O will be lost, so we need to be sure to
+		// flush anything before shutting down
 		apis.shutdownChannel <- nil
 	}()
 
@@ -141,7 +160,7 @@ func (apis *APIService) handleInput(inputBytes []byte) error {
 	if apis.activeModule == nil {
 		// if we're running in FileIO mode then write the file first
 		if apis.fileIO {
-			if err := os.WriteFile(InputFilePath, inputBytes, 0444); err != nil {
+			if err := os.WriteFile(InputFilePath, inputBytes, 0666); err != nil {
 				return err
 			}
 		}
