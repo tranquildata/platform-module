@@ -53,11 +53,13 @@ func Start(environment map[string]string) (Module, error) {
 		return nil, fmt.Errorf("failed to start module: %s\n", err.Error())
 	}
 
-	return &module{
+	m := &module{
 		cmd:    cmd,
 		input:  cmdInput,
 		output: cmdOutput,
-	}, nil
+	}
+
+	return m, nil
 }
 
 func (m *module) WaitForStop() error {
