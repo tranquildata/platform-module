@@ -37,8 +37,10 @@ type APIService struct {
 	fileIO        bool
 	activeModule  module.Module
 
-	waitTimeout     time.Duration
-	runID           atomic.Value
+	waitTimeout time.Duration
+	runID       atomic.Value
+	output      atomic.Value
+
 	logger          *slog.Logger
 	moduleChannel   chan error
 	shutdownChannel chan any
@@ -205,13 +207,27 @@ func (apis *APIService) asyncGetOutput(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var out *output
-	select {
-	case out = <-apis.outputChannel:
-		//pass
-	case <-time.After(apis.waitTimeout):
-		http.Error(w, "timed out waiting for output", http.StatusGatewayTimeout)
-		return
+	if savedOutput := apis.output.Load(); savedOutput != nil {
+		if outStruct, outputOK := savedOutput.(*output); outputOK {
+			out = outStruct
+		}
 	}
+	if out == nil {
+		select {
+		case out = <-apis.outputChannel:
+			//pass
+		case <-time.After(apis.waitTimeout):
+			http.Error(w, "timed out waiting for output", http.StatusGatewayTimeout)
+			return
+		}
+	}
+	if out == nil {
+		//some issue caused a nil to be written to the channel
+		out = &output{
+			err: fmt.Errorf("nil output"),
+		}
+	}
+	apis.output.Store(out)
 
 	if out.err != nil {
 		http.Error(w, out.err.Error(), http.StatusInternalServerError)
