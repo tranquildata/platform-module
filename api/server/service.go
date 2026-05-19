@@ -195,6 +195,9 @@ func (apis *APIService) asyncGetOutput(w http.ResponseWriter, r *http.Request) {
 	var runId string
 	if runIds, OK := r.URL.Query()[RunIdParamName]; OK && len(runIds) > 0 {
 		runId = runIds[0]
+	} else {
+		http.Error(w, fmt.Sprintf("missing %s query parameter", RunIdParamName), http.StatusBadRequest)
+		return
 	}
 	if runningId := apis.runID.Load(); runningId != nil {
 		if asStr, strOK := runningId.(string); strOK && len(asStr) > 0 {
