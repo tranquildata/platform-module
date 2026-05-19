@@ -139,7 +139,8 @@ func (apis *APIService) Serve(port uint16) error {
 
 func (apis *APIService) registerHTTPEndpoints(mux *http.ServeMux) {
 	mux.HandleFunc("OPTIONS /", apis.serviceInfo)
-	mux.HandleFunc("PUT /", apis.inputData) //synchronous, waits for output
+	mux.HandleFunc("PUT /", apis.inputData)
+	mux.HandleFunc("OPTIONS /async", apis.serviceInfo) //synchronous, waits for output
 	mux.HandleFunc("PUT /async", apis.asyncInputData)
 	mux.HandleFunc("GET /async", apis.asyncGetOutput)
 }
