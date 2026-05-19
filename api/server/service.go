@@ -138,9 +138,9 @@ func (apis *APIService) Serve(port uint16) error {
 }
 
 func (apis *APIService) registerHTTPEndpoints(mux *http.ServeMux) {
-	mux.HandleFunc("HEAD /", func(http.ResponseWriter, *http.Request) {})
 	mux.HandleFunc("OPTIONS /", apis.serviceInfo)
-	mux.HandleFunc("PUT /", apis.inputData) //synchronous, waits for output
+	mux.HandleFunc("PUT /", apis.inputData)
+	mux.HandleFunc("OPTIONS /async", apis.serviceInfo) //synchronous, waits for output
 	mux.HandleFunc("PUT /async", apis.asyncInputData)
 	mux.HandleFunc("GET /async", apis.asyncGetOutput)
 }
@@ -164,6 +164,9 @@ func (apis *APIService) asyncInputData(w http.ResponseWriter, r *http.Request) {
 	var runId string
 	if runIds, OK := r.URL.Query()[RunIdParamName]; OK && len(runIds) > 0 {
 		runId = runIds[0]
+	} else {
+		http.Error(w, fmt.Sprintf("missing %s query parameter", RunIdParamName), http.StatusBadRequest)
+		return
 	}
 	if runningId := apis.runID.Load(); runningId != nil {
 		if asStr, strOK := runningId.(string); strOK && len(asStr) > 0 {
@@ -193,6 +196,9 @@ func (apis *APIService) asyncGetOutput(w http.ResponseWriter, r *http.Request) {
 	var runId string
 	if runIds, OK := r.URL.Query()[RunIdParamName]; OK && len(runIds) > 0 {
 		runId = runIds[0]
+	} else {
+		http.Error(w, fmt.Sprintf("missing %s query parameter", RunIdParamName), http.StatusBadRequest)
+		return
 	}
 	if runningId := apis.runID.Load(); runningId != nil {
 		if asStr, strOK := runningId.(string); strOK && len(asStr) > 0 {
