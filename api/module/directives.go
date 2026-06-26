@@ -23,7 +23,8 @@ type Directive struct {
 }
 
 type Batch struct {
-	Files bool `json:"files"`
+	Files    bool `json:"files"`
+	Multiple bool `json:"multiple"`
 }
 
 // Load attempts to read & process the directives file.
@@ -50,12 +51,12 @@ func Load() (*DirectiveMap, error) {
 
 // Config returns (in-order) whether the directive is present, if it is present then
 // whether modality is batch, and if it is batch then whether file IO is used
-func (dm *DirectiveMap) Config(name string) (bool, bool, bool) {
+func (dm *DirectiveMap) Config(name string) (present bool, batch bool, fileIO bool, multiple bool) {
 	if config, present := dm.directives[name]; !present {
-		return false, false, false
+		return false, false, false, false
 	} else if config == nil {
-		return true, false, false
+		return true, false, false, false
 	} else {
-		return true, true, config.Files
+		return true, true, config.Files, config.Multiple
 	}
 }

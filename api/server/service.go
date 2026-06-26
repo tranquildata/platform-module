@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
@@ -32,10 +33,11 @@ type ServiceInfo struct {
 }
 
 type APIService struct {
-	runtimeConfig *config.RuntimeConfig
-	batch         bool
-	fileIO        bool
-	activeModule  module.Module
+	runtimeConfig  *config.RuntimeConfig
+	batch          bool
+	fileIO         bool
+	multipleInputs bool
+	activeModule   module.Module
 
 	waitTimeout time.Duration
 	runID       atomic.Value
@@ -52,7 +54,7 @@ type output struct {
 	err         error
 }
 
-func Setup(runtimeConfig *config.RuntimeConfig, batch bool, fileIO bool) *APIService {
+func Setup(runtimeConfig *config.RuntimeConfig, batch bool, fileIO bool, multipleInputs bool) *APIService {
 	logger := slog.New(slog.NewTextHandler(
 		os.Stdout,
 		&slog.HandlerOptions{
@@ -62,6 +64,7 @@ func Setup(runtimeConfig *config.RuntimeConfig, batch bool, fileIO bool) *APISer
 		runtimeConfig:   runtimeConfig,
 		batch:           batch,
 		fileIO:          fileIO,
+		multipleInputs:  multipleInputs,
 		logger:          logger,
 		waitTimeout:     1 * time.Second,
 		moduleChannel:   make(chan error),
@@ -288,7 +291,17 @@ func (apis *APIService) handleInput(inputBytes []byte) error {
 	if apis.activeModule == nil {
 		// if we're running in FileIO mode then write the file first
 		if apis.fileIO {
-			if err := os.WriteFile(InputFilePath, inputBytes, 0666); err != nil {
+			if apis.multipleInputs {
+				inputFiles := make(map[string][]byte)
+				if err := json.Unmarshal(inputBytes, &inputFiles); err != nil {
+					return err
+				}
+				for fileName, data := range inputFiles {
+					if err := os.WriteFile(path.Join(InputFilePath, fileName), data, 0666); err != nil {
+						return err
+					}
+				}
+			} else if err := os.WriteFile(InputFilePath, inputBytes, 0666); err != nil {
 				return err
 			}
 		}
@@ -305,8 +318,8 @@ func (apis *APIService) handleInput(inputBytes []byte) error {
 
 // startModule attempts to start the module via the wrapper script, communicating
 // the channel listener either the new module or failure
-func (apis *APIService) startModule() error {
-	activeModule, err := module.Start(apis.runtimeConfig.Environment())
+func (apis *APIService) startModule(inputFiles ...string) error {
+	activeModule, err := module.Start(apis.runtimeConfig.Environment(inputFiles...))
 	if err != nil {
 		apis.logger.Error("module started with error", "error", err)
 	} else {

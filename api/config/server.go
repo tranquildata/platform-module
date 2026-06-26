@@ -6,10 +6,12 @@ package config
 
 import (
 	"os"
+	"strings"
 )
 
 const (
-	DirectiveKey = "MODULE_DIRECTIVE"
+	DirectiveKey  = "MODULE_DIRECTIVE"
+	BatchInputKey = "BATCH_INPUTS"
 )
 
 type RuntimeConfig struct {
@@ -32,8 +34,13 @@ func ServerConfig() (*RuntimeConfig, error) {
 // Environment returns the full environment that should be shared with the
 // wrapper script .. note that currently this only includes the specific variables
 // the API service uses, but this could expand to include the full ENV.
-func (rc *RuntimeConfig) Environment() map[string]string {
-	return map[string]string{
+func (rc *RuntimeConfig) Environment(inputFiles ...string) map[string]string {
+	envMap := map[string]string{
 		DirectiveKey: rc.Directive,
 	}
+	if len(inputFiles) > 0 {
+		envMap[BatchInputKey] = strings.Join(inputFiles, " ")
+	}
+
+	return envMap
 }

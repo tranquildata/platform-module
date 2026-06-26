@@ -50,14 +50,14 @@ func runStartCommand(port uint16) {
 		fmt.Printf("failed to load module directives: %s\n", err.Error())
 		return
 	}
-	present, batch, fileIO := directiveMap.Config(runtimeConfig.Directive)
+	present, batch, fileIO, multipleInputs := directiveMap.Config(runtimeConfig.Directive)
 	if !present {
 		fmt.Printf("unknown module directive: %s\n", runtimeConfig.Directive)
 		return
 	}
 
 	// setup, run, and wait for the API service to terminate
-	apiService := server.Setup(runtimeConfig, batch, fileIO)
+	apiService := server.Setup(runtimeConfig, batch, fileIO, multipleInputs)
 	if err = apiService.Serve(port); err != nil {
 		fmt.Printf("server failed: %s\n", err.Error())
 		return
