@@ -373,6 +373,11 @@ func handleFileInput(inputBytes []byte, inputDirectory string) error {
 	if err := json.Unmarshal(inputBytes, &fileMapping); err != nil {
 		return err
 	}
+	if info, err := os.Stat(inputDirectory); err != nil || !info.IsDir() {
+		if err = os.Mkdir(inputDirectory, 0777); err != nil {
+			return err
+		}
+	}
 	for filename, data := range fileMapping {
 		if err := os.WriteFile(path.Join(inputDirectory, filename), data, 0666); err != nil {
 			return err
