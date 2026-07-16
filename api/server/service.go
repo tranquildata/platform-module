@@ -13,8 +13,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,9 +24,12 @@ import (
 	"github.com/tranquildata/platform-module/module"
 )
 
-const InputFilePath = "/moduleio/input"
+const InputDirectoryPath = "/moduleio/input"
 const OutputDirectoryPath = "/moduleio/output"
 const RunIdParamName = "runId"
+const UploadOnlyParamName = "uploadOnly"
+
+const DefaultMaximumOutputSize = 64 * 1024 * 1024 //64 MB
 
 type ServiceInfo struct {
 	Directive string `json:"directive"`
@@ -32,10 +37,11 @@ type ServiceInfo struct {
 }
 
 type APIService struct {
-	runtimeConfig *config.RuntimeConfig
-	batch         bool
-	fileIO        bool
-	activeModule  module.Module
+	runtimeConfig     *config.RuntimeConfig
+	batch             bool
+	fileIO            bool
+	maximumOutputSize uint64
+	activeModule      module.Module
 
 	waitTimeout time.Duration
 	runID       atomic.Value
@@ -48,8 +54,22 @@ type APIService struct {
 }
 
 type output struct {
-	outputFiles map[string][]byte
-	err         error
+	//fileIO case
+	outputFilenames []string //the list of output filenames
+	cursorLock      sync.Mutex
+	outputCursor    int //the spot in outputFilenames where the last output GET stopped (0 means no GET as yet, len(outputFilenames) means all output was sent)
+
+	//stdio case
+	outputBytes []byte
+
+	//both cases
+	maximumOutputSize uint64
+	err               error
+}
+
+type OutputResponse struct {
+	Outputs      map[string][]byte `json:"outputs"`      //the set of output files, for stdout runs there will be one entry with the key of ""
+	CursorOffset int               `json:"cursorOffset"` //the offset at which to start the next output page, 0 means all output has been returned
 }
 
 func Setup(runtimeConfig *config.RuntimeConfig, batch bool, fileIO bool) *APIService {
@@ -168,6 +188,10 @@ func (apis *APIService) asyncInputData(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("missing %s query parameter", RunIdParamName), http.StatusBadRequest)
 		return
 	}
+	uploadOnly := false
+	if uploadParams, OK := r.URL.Query()[UploadOnlyParamName]; OK && len(uploadParams) > 0 {
+		uploadOnly = true
+	}
 	if runningId := apis.runID.Load(); runningId != nil {
 		if asStr, strOK := runningId.(string); strOK && len(asStr) > 0 {
 			//already running something, we need to fail
@@ -179,14 +203,16 @@ func (apis *APIService) asyncInputData(w http.ResponseWriter, r *http.Request) {
 	if bodyBytes, err := io.ReadAll(r.Body); err != nil {
 		http.Error(w, "failed to read input: "+err.Error(), http.StatusBadRequest)
 		return
-	} else if err = apis.handleInput(append(bodyBytes, '\n')); err != nil {
+	} else if err = apis.handleInput(append(bodyBytes, '\n'), !uploadOnly); err != nil {
 		http.Error(w, "failed to provide input to module: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	apis.runID.Store(runId)
 
-	//kick off goroutine to wait for output
-	go apis.handleOutputAsync(apis.outputChannel)
+	if !uploadOnly {
+		//kick off goroutine to wait for output
+		go apis.handleOutputAsync(apis.outputChannel)
+	}
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(runId))
@@ -238,14 +264,16 @@ func (apis *APIService) asyncGetOutput(w http.ResponseWriter, r *http.Request) {
 	if out.err != nil {
 		http.Error(w, out.err.Error(), http.StatusInternalServerError)
 		return
-	} else if len(out.outputFiles) > 0 {
-		if responseBytes, err := json.Marshal(out.outputFiles); err != nil {
+	} else if len(out.outputFilenames) > 0 {
+		//output is present, fetch the next page
+		if responseBytes, err := out.responseBytes(OutputDirectoryPath); err != nil {
 			http.Error(w, "failed to encode module output: "+err.Error(), http.StatusInternalServerError)
 			return
 		} else {
 			w.Write(responseBytes) //nolint:errcheck
 		}
 	} else {
+		//output not yet generated, simulator still running
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -263,15 +291,15 @@ func (apis *APIService) inputData(w http.ResponseWriter, r *http.Request) {
 	if bodyBytes, err := io.ReadAll(r.Body); err != nil {
 		http.Error(w, "failed to read input: "+err.Error(), http.StatusBadRequest)
 		return
-	} else if err = apis.handleInput(append(bodyBytes, '\n')); err != nil {
+	} else if err = apis.handleInput(append(bodyBytes, '\n'), true); err != nil {
 		http.Error(w, "failed to provide input to module: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	if responseMap, err := apis.handleFullOutput(); err != nil {
-		http.Error(w, "failed to get output from module: "+err.Error(), http.StatusInternalServerError)
+	if outs := apis.handleOutput(); outs.err != nil {
+		http.Error(w, "failed to get output from module: "+outs.err.Error(), http.StatusInternalServerError)
 		return
-	} else if responseBytes, err := json.Marshal(responseMap); err != nil {
+	} else if responseBytes, err := outs.responseBytes(OutputDirectoryPath); err != nil {
 		http.Error(w, "failed to encode module output: "+err.Error(), http.StatusInternalServerError)
 		return
 	} else {
@@ -279,26 +307,81 @@ func (apis *APIService) inputData(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (o *output) responseBytes(outputDirectory string) ([]byte, error) {
+	resp := &OutputResponse{
+		Outputs: make(map[string][]byte, len(o.outputFilenames)+1),
+	}
+	var err error
+	if o.outputBytes != nil {
+		resp.Outputs[""] = o.outputBytes
+	} else if resp.Outputs, resp.CursorOffset, err = o.fileMap(outputDirectory); err != nil {
+		return nil, err
+	}
+	return json.Marshal(resp)
+}
+
+func (o *output) fileMap(outputDirectory string) (map[string][]byte, int, error) {
+	outputs := make(map[string][]byte, len(o.outputFilenames))
+	o.cursorLock.Lock()
+	defer o.cursorLock.Unlock()
+	currentSize := 0
+	idx := o.outputCursor
+	for ; idx < len(o.outputFilenames); idx++ {
+		filename := o.outputFilenames[idx]
+		if fileBytes, err := os.ReadFile(path.Join(outputDirectory, filename)); err != nil {
+			return nil, 0, err
+		} else {
+			outputs[filename] = fileBytes
+			currentSize += len(fileBytes)
+		}
+		if currentSize >= int(o.maximumOutputSize) {
+			break
+		}
+	}
+	o.outputCursor = (idx + 1) % len(o.outputFilenames)
+	return outputs, o.outputCursor, nil
+}
+
 // handleInput routes data to the module. If the module hasn't been started yet
 // then this routine will start the module. If the module expects file input
 // then this routine will write the input to the well-known input file before
 // starting the module.
-func (apis *APIService) handleInput(inputBytes []byte) error {
+func (apis *APIService) handleInput(inputBytes []byte, startModule bool) error {
 	// if there is no running module, start it now
 	if apis.activeModule == nil {
 		// if we're running in FileIO mode then write the file first
 		if apis.fileIO {
-			if err := os.WriteFile(InputFilePath, inputBytes, 0666); err != nil {
+			if err := handleFileInput(inputBytes, InputDirectoryPath); err != nil {
 				return err
 			}
 		}
-		if err := apis.startModule(); err != nil {
-			return err
+		if startModule {
+			if err := apis.startModule(); err != nil {
+				return err
+			}
 		}
 	}
 
 	if !apis.fileIO {
 		return apis.activeModule.Write(inputBytes)
+	}
+	return nil
+}
+
+func handleFileInput(inputBytes []byte, inputDirectory string) error {
+	fileMapping := make(map[string][]byte)
+	if err := json.Unmarshal(inputBytes, &fileMapping); err != nil {
+		return err
+	}
+	if info, err := os.Stat(inputDirectory); err != nil || !info.IsDir() {
+		if err = os.Mkdir(inputDirectory, 0777); err != nil {
+			return err
+		}
+	}
+	for filename, data := range fileMapping {
+		if err := os.WriteFile(path.Join(inputDirectory, filename), data, 0666); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -318,19 +401,23 @@ func (apis *APIService) startModule() error {
 }
 
 func (apis *APIService) handleOutputAsync(outputCh chan *output) {
-	outputFiles, err := apis.handleFullOutput()
-	out := &output{
-		outputFiles: outputFiles,
-		err:         err,
-	}
+	out := apis.handleOutput()
 	outputCh <- out
+}
+
+func (apis *APIService) handleOutput() *output {
+	outputFilenames, outputBytes, err := apis.handleFullOutput()
+	return &output{
+		outputFilenames: outputFilenames,
+		outputCursor:    0,
+		outputBytes:     outputBytes,
+		err:             err,
+	}
 }
 
 // handleFullOutput retrieves the final data output from the module. This routine will
 // Wait() on the module before returning.
-func (apis *APIService) handleFullOutput() (map[string][]byte, error) {
-	outputMap := map[string][]byte{}
-
+func (apis *APIService) handleFullOutput() ([]string, []byte, error) {
 	if apis.fileIO {
 		apis.logger.Debug("using fileIO")
 		// wait for the module to complete to ensure all files are written
@@ -340,44 +427,45 @@ func (apis *APIService) handleFullOutput() (map[string][]byte, error) {
 			if _, readErr := apis.activeModule.ReadFully(&buffer); readErr != nil {
 				apis.logger.Error("error reading command output", "error", readErr)
 			}
-			return nil, err
+			return nil, nil, err
 		}
 
 		// marshal up all the file contents into a map
-		if files, err := os.ReadDir(OutputDirectoryPath); err != nil {
+		if outputRunDirs, err := os.ReadDir(OutputDirectoryPath); err != nil {
 			apis.logger.Error("readDir error", "error", err)
-			return nil, err
+			return nil, nil, err
 		} else {
-			names := make([]string, len(files))[0:0]
-			for _, entry := range files {
+			names := make([]string, len(outputRunDirs))[0:0]
+			for _, entry := range outputRunDirs {
 				if !entry.IsDir() {
-					if fileBytes, err := os.ReadFile(fmt.Sprintf("%s/%s", OutputDirectoryPath, entry.Name())); err == nil {
-						outputMap[entry.Name()] = fileBytes
-					}
 					names = append(names, entry.Name())
 				} else {
-					names = append(names, fmt.Sprintf("%s/", entry.Name()))
+					if runFiles, err := os.ReadDir(path.Join(OutputDirectoryPath, entry.Name())); err != nil {
+						return nil, nil, err
+					} else {
+						for _, runEntry := range runFiles {
+							names = append(names, path.Join(entry.Name(), runEntry.Name()))
+						}
+					}
 				}
 			}
 			if apis.logger.Enabled(context.Background(), slog.LevelDebug) {
 				apis.logger.Debug("output files", "fileList", strings.Join(names, ","))
 			}
+			return names, nil, nil
 		}
 	} else {
 		// read all output until there's nothing left, and put that into a single entry
 		// with an empty name to signal this was standard-out not a named file
 		var buffer bytes.Buffer
 		if _, err := apis.activeModule.ReadFully(&buffer); err != nil {
-			return nil, err
-		} else {
-			outputMap[""] = buffer.Bytes()
+			return nil, nil, err
 		}
 		// for parity with the fileIO version, wait for the module to terminate, which
 		// should be instant since stdout is already closed
 		if err := apis.activeModule.WaitForStop(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		return nil, buffer.Bytes(), nil
 	}
-
-	return outputMap, nil
 }

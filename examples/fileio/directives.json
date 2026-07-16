@@ -1,6 +1,6 @@
 [
     {
-        "name": "multifile",
+        "name": "simulate",
         "batch": {
             "files": true
         }
