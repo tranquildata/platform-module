@@ -14,4 +14,5 @@
 #
 # The name of the module directive is available as $MODULE_DIRECTIVE.
 
-/usr/local/bin/tqd-module /moduleio/input /moduleio/output/output.csv
+#This is assuming the module accepts an <input dir> <output dir> as args
+/usr/local/bin/tqd-module /moduleio/input /moduleio/output
