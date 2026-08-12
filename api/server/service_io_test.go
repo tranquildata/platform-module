@@ -50,8 +50,9 @@ func Test_thatPagingWorks(t *testing.T) {
 		outputCursor:      0,
 		maximumOutputSize: 1,
 	}
+	var resp *OutputResponse
 	for idx, expectedFilename := range outs.outputFilenames {
-		resp := &OutputResponse{}
+		resp = &OutputResponse{}
 		responseBytes, err := outs.responseBytes("testresources")
 		if err != nil {
 			t.Fatal(err)
@@ -67,8 +68,69 @@ func Test_thatPagingWorks(t *testing.T) {
 			t.Errorf("bad cursor offset %d", resp.CursorOffset)
 		}
 	}
+	//make sure that the cursor offset is 0 at the end
+	if resp.CursorOffset != 0 {
+		t.Errorf("bad ending cursor offset %d != 0", resp.CursorOffset)
+	}
 	//make sure that it resets to the beginning
-	resp := &OutputResponse{}
+	resp = &OutputResponse{}
+	responseBytes, err := outs.responseBytes("testresources")
+	if err != nil {
+		t.Fatal(err)
+	} else if err = json.Unmarshal(responseBytes, resp); err != nil {
+		t.Fatal(err)
+	} else if resp.CursorOffset != 1 {
+		t.Errorf("bad cursor offset %d", resp.CursorOffset)
+	} else if _, present := resp.Outputs[outs.outputFilenames[0]]; !present {
+		t.Errorf("missing expected file")
+	}
+}
+
+func Test_thatPagingWorksWithCoPrimeIndices(t *testing.T) {
+	outs := &output{
+		outputFilenames:   []string{"run02/file03.csv", "run01/file01.csv", "run02/file02.csv"}, //277 bytes, 78 bytes, 60 bytes
+		outputCursor:      0,
+		maximumOutputSize: 200,
+	}
+	var resp *OutputResponse
+	remaining := make(map[string]bool, len(outs.outputFilenames))
+	for _, nextOutput := range outs.outputFilenames {
+		remaining[nextOutput] = true
+	}
+	var offset int = -1
+	for offset != 0 {
+		resp = &OutputResponse{}
+		responseBytes, err := outs.responseBytes("testresources")
+		if err != nil {
+			t.Fatal(err)
+		} else if err = json.Unmarshal(responseBytes, resp); err != nil {
+			t.Fatal(err)
+		}
+		if l := len(resp.Outputs); l == 0 {
+			t.Errorf("empty outputs %d", l)
+		}
+		for nextOutput, _ := range resp.Outputs {
+			if _, present := remaining[nextOutput]; !present {
+				t.Errorf("unexpected file %s", nextOutput)
+			} else {
+				delete(remaining, nextOutput)
+			}
+		}
+		if resp.CursorOffset != 1 && resp.CursorOffset != 0 {
+			//first call should return 1 file, the second call should return the rest
+			t.Errorf("bad cursor offset %d", resp.CursorOffset)
+		}
+		offset = resp.CursorOffset
+	}
+	if len(remaining) > 0 {
+		t.Errorf("missing expected files %v", remaining)
+	}
+	//make sure that the cursor offset is 0 at the end
+	if resp.CursorOffset != 0 {
+		t.Errorf("bad ending cursor offset %d != 0", resp.CursorOffset)
+	}
+	//make sure that it resets to the beginning and returns the first file over again
+	resp = &OutputResponse{}
 	responseBytes, err := outs.responseBytes("testresources")
 	if err != nil {
 		t.Fatal(err)

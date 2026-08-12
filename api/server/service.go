@@ -79,14 +79,15 @@ func Setup(runtimeConfig *config.RuntimeConfig, batch bool, fileIO bool) *APISer
 			Level: slog.LevelInfo,
 		}))
 	return &APIService{
-		runtimeConfig:   runtimeConfig,
-		batch:           batch,
-		fileIO:          fileIO,
-		logger:          logger,
-		waitTimeout:     1 * time.Second,
-		moduleChannel:   make(chan error),
-		shutdownChannel: make(chan any),
-		outputChannel:   make(chan *output),
+		runtimeConfig:     runtimeConfig,
+		batch:             batch,
+		fileIO:            fileIO,
+		logger:            logger,
+		waitTimeout:       1 * time.Second,
+		maximumOutputSize: DefaultMaximumOutputSize,
+		moduleChannel:     make(chan error),
+		shutdownChannel:   make(chan any),
+		outputChannel:     make(chan *output),
 	}
 }
 
@@ -338,7 +339,11 @@ func (o *output) fileMap(outputDirectory string) (map[string][]byte, int, error)
 			break
 		}
 	}
-	o.outputCursor = (idx + 1) % len(o.outputFilenames)
+	if idx >= len(o.outputFilenames) {
+		o.outputCursor = 0
+	} else {
+		o.outputCursor = (idx + 1) % len(o.outputFilenames)
+	}
 	return outputs, o.outputCursor, nil
 }
 
@@ -408,10 +413,11 @@ func (apis *APIService) handleOutputAsync(outputCh chan *output) {
 func (apis *APIService) handleOutput() *output {
 	outputFilenames, outputBytes, err := apis.handleFullOutput()
 	return &output{
-		outputFilenames: outputFilenames,
-		outputCursor:    0,
-		outputBytes:     outputBytes,
-		err:             err,
+		outputFilenames:   outputFilenames,
+		outputCursor:      0,
+		outputBytes:       outputBytes,
+		maximumOutputSize: apis.maximumOutputSize,
+		err:               err,
 	}
 }
 
