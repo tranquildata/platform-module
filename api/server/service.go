@@ -194,7 +194,7 @@ func (apis *APIService) asyncInputData(w http.ResponseWriter, r *http.Request) {
 		uploadOnly = true
 	}
 	if runningId := apis.runID.Load(); runningId != nil {
-		if asStr, strOK := runningId.(string); strOK && len(asStr) > 0 {
+		if asStr, strOK := runningId.(string); strOK && len(asStr) > 0 && runId != runningId {
 			//already running something, we need to fail
 			http.Error(w, fmt.Sprintf("already running a job with ID %s", asStr), http.StatusConflict)
 			return
