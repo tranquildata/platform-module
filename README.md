@@ -94,7 +94,7 @@ For long-running modules, or inputs too large for a single call, use the asynchr
 * `PUT /async?runId=ID` stages any input files in the body and then starts the module. It returns immediately with the `runId`.
 * `GET /async?runId=ID` collects the output. It returns `504` while the module is still running, so retry until it doesn't. Output is returned in pages of about 64 MB. A non-zero `cursorOffset` means more output remains, so call again for the next page. `204` means the module finished without writing any output files.
 
-Input that arrives after the module has started is rejected with `409`. Unlike `PUT /`, the asynchronous endpoints do not shut down the container when the run completes.
+Input that arrives after the module has started is rejected with `409`. Once the module has terminated, the container shuts down after the final page of output, the `204`, or the module's error has been returned. If no output is requested for 20 minutes after the module terminates, the container shuts down anyway.
 
 ### Streaming Configurations ###
 
@@ -104,4 +104,4 @@ Input that arrives after the module has started is rejected with `409`. Unlike `
 
 Because output is collected independently of input, a response contains whatever output is ready when it is sent. That may not be the response to that call's own input. Use `GET /` to collect output that arrives later.
 
-When the module terminates and all of its output has been returned, the container shuts down. If the module exits with an error and has no remaining output, the call returns `500`.
+When the module terminates and all of its output has been returned, the container shuts down. If output remains and none is requested for 20 minutes after the module terminates, the container shuts down anyway. If the module exits with an error and has no remaining output, the call returns `500`.

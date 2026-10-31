@@ -29,6 +29,7 @@ const RunIdParamName = "runId"
 const UploadOnlyParamName = "uploadOnly"
 
 const DefaultMaximumOutputSize = 64 * 1024 * 1024 //64 MB
+const DefaultCollectionTimeout = 20 * time.Minute
 
 var errModuleRunning = fmt.Errorf("module is already running; batch input must be staged before the module starts")
 var errInputClosed = fmt.Errorf("module input has already been closed")
@@ -52,9 +53,12 @@ type APIService struct {
 	stream       *stream //streaming case only, set when the module starts
 	shutdownOnce sync.Once
 
-	waitTimeout time.Duration
-	runID       atomic.Value
-	output      atomic.Value
+	waitTimeout       time.Duration
+	collectionTimeout time.Duration //how long async output may go uncollected after the module terminates
+	collectionLock    sync.Mutex
+	collectionTimer   *time.Timer
+	runID             atomic.Value
+	output            atomic.Value
 
 	logger          *slog.Logger
 	moduleChannel   chan error
@@ -68,6 +72,7 @@ type output struct {
 	cursorLock        sync.Mutex
 	outputCursor      int    //the spot in outputFilenames where the last output GET stopped (0 means no GET as yet, len(outputFilenames) means all output was sent)
 	maximumOutputSize uint64 //the size at which to end an output page, 0 means no paging
+	allSent           bool   //set once the final page of output has been returned
 
 	//streaming case
 	outputBytes []byte
@@ -92,6 +97,7 @@ func Setup(runtimeConfig *config.RuntimeConfig, streaming bool) *APIService {
 		streaming:         streaming,
 		logger:            logger,
 		waitTimeout:       1 * time.Second,
+		collectionTimeout: DefaultCollectionTimeout,
 		maximumOutputSize: DefaultMaximumOutputSize,
 		inputDirectory:    InputDirectoryPath,
 		outputDirectory:   OutputDirectoryPath,
@@ -287,21 +293,52 @@ func (apis *APIService) asyncGetOutput(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	apis.output.Store(out)
+	apis.resetCollectionTimer()
 
+	// the module has terminated, so once its error, its last page of output, or the
+	// fact that it had no output has been returned, the run is complete
 	if out.err != nil {
+		defer apis.requestShutdown()
 		http.Error(w, out.err.Error(), http.StatusInternalServerError)
-		return
 	} else if len(out.outputFilenames) > 0 {
 		//output is present, fetch the next page
 		if responseBytes, err := out.responseBytes(apis.outputDirectory); err != nil {
 			http.Error(w, "failed to encode module output: "+err.Error(), http.StatusInternalServerError)
-			return
 		} else {
+			if out.finished() {
+				defer apis.requestShutdown()
+			}
 			w.Write(responseBytes) //nolint:errcheck
 		}
 	} else {
-		//output not yet generated, simulator still running
+		//the module terminated without writing any output files
+		defer apis.requestShutdown()
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// startCollectionTimer starts the window in which output must be collected
+// after the module terminates. If it expires, shutdown is requested so that an
+// abandoned run doesn't keep the container alive.
+func (apis *APIService) startCollectionTimer() {
+	apis.collectionLock.Lock()
+	defer apis.collectionLock.Unlock()
+	if apis.collectionTimer != nil {
+		return
+	}
+	apis.collectionTimer = time.AfterFunc(apis.collectionTimeout, func() {
+		apis.logger.Error("module output was not collected before timeout; shutting down")
+		apis.requestShutdown()
+	})
+}
+
+// resetCollectionTimer restarts the collection window after each output request.
+// It has no effect until the module has terminated.
+func (apis *APIService) resetCollectionTimer() {
+	apis.collectionLock.Lock()
+	defer apis.collectionLock.Unlock()
+	if apis.collectionTimer != nil {
+		apis.collectionTimer.Reset(apis.collectionTimeout)
 	}
 }
 
@@ -375,6 +412,7 @@ func (apis *APIService) streamOutput(w http.ResponseWriter, r *http.Request) {
 // and all of its output has been returned, shutdown is requested.
 func (apis *APIService) writeStreamOutput(w http.ResponseWriter) {
 	outs, finished := apis.stream.collect(apis.waitTimeout)
+	apis.resetCollectionTimer()
 	if finished {
 		apis.requestShutdown()
 	}
@@ -465,7 +503,17 @@ func (o *output) fileMap(outputDirectory string) (map[string][]byte, int, error)
 	} else {
 		o.outputCursor = (idx + 1) % len(o.outputFilenames)
 	}
+	if o.outputCursor == 0 {
+		o.allSent = true
+	}
 	return outputs, o.outputCursor, nil
+}
+
+// finished returns whether the final page of output has been returned.
+func (o *output) finished() bool {
+	o.cursorLock.Lock()
+	defer o.cursorLock.Unlock()
+	return o.allSent
 }
 
 // handleInput routes data to the module. For batch directives the input is a JSON
@@ -531,7 +579,13 @@ func (apis *APIService) startModule() error {
 		apis.activeModule = activeModule
 		if apis.streaming {
 			apis.stream = newStream()
-			go apis.stream.pump(activeModule, apis.logger, apis.requestShutdown)
+			go apis.stream.pump(activeModule, apis.logger, func(collected bool) {
+				if collected {
+					apis.requestShutdown()
+				} else {
+					apis.startCollectionTimer()
+				}
+			})
 		}
 	}
 	select {
@@ -543,6 +597,7 @@ func (apis *APIService) startModule() error {
 
 func (apis *APIService) handleOutputAsync(outputCh chan *output) {
 	out := apis.handleOutput()
+	apis.startCollectionTimer()
 	outputCh <- out
 }
 

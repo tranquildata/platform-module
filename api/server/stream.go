@@ -32,8 +32,8 @@ func newStream() *stream {
 }
 
 // pump reads the module's standard-out until EOF, then waits for the module to
-// terminate. If all output has already been collected by then, onFinished is called.
-func (s *stream) pump(m module.Module, logger *slog.Logger, onFinished func()) {
+// terminate. onTerminated is then called with whether all output had already been collected.
+func (s *stream) pump(m module.Module, logger *slog.Logger, onTerminated func(collected bool)) {
 	chunk := make([]byte, 32*1024)
 	var readErr error
 	for {
@@ -71,9 +71,7 @@ func (s *stream) pump(m module.Module, logger *slog.Logger, onFinished func()) {
 	empty := s.buffer.Len() == 0
 	s.lock.Unlock()
 
-	if empty {
-		onFinished()
-	}
+	onTerminated(empty)
 }
 
 // collect returns all output produced since the last collection. If no output is
