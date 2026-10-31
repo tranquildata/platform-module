@@ -1,8 +1,6 @@
 [
     {
         "name": "simulate",
-        "batch": {
-            "files": true
-        }
+        "streaming": false
     }
 ]
