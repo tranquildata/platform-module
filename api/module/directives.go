@@ -5,6 +5,7 @@
 package module
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,16 +15,12 @@ import (
 const DirectivesFile = "/moduleio/directives.json"
 
 type DirectiveMap struct {
-	directives map[string]*Batch
+	directives map[string]bool
 }
 
 type Directive struct {
-	Name        string `json:"name"`
-	BatchConfig *Batch `json:"batch,omitempty"`
-}
-
-type Batch struct {
-	Files bool `json:"files"`
+	Name      string `json:"name"`
+	Streaming bool   `json:"streaming"`
 }
 
 // Load attempts to read & process the directives file.
@@ -32,15 +29,29 @@ func Load() (*DirectiveMap, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read directives: %s", err.Error())
 	}
+	return Parse(jsonBytes)
+}
+
+// Parse processes the contents of a directives file. Unknown fields are rejected
+// so that files using an older syntax fail loudly rather than being misread, and
+// directive names must be unique.
+func Parse(jsonBytes []byte) (*DirectiveMap, error) {
+	decoder := json.NewDecoder(bytes.NewReader(jsonBytes))
+	decoder.DisallowUnknownFields()
 
 	var directives []Directive
-	if err = json.Unmarshal(jsonBytes, &directives); err != nil {
+	if err := decoder.Decode(&directives); err != nil {
 		return nil, fmt.Errorf("failed to process directives: %s", err.Error())
 	}
 
-	directiveMap := map[string]*Batch{}
+	directiveMap := make(map[string]bool, len(directives))
 	for _, directive := range directives {
-		directiveMap[directive.Name] = directive.BatchConfig
+		if directive.Name == "" {
+			return nil, fmt.Errorf("failed to process directives: directive is missing a name")
+		} else if _, present := directiveMap[directive.Name]; present {
+			return nil, fmt.Errorf("failed to process directives: duplicate directive %s", directive.Name)
+		}
+		directiveMap[directive.Name] = directive.Streaming
 	}
 
 	return &DirectiveMap{
@@ -48,14 +59,9 @@ func Load() (*DirectiveMap, error) {
 	}, nil
 }
 
-// Config returns (in-order) whether the directive is present, if it is present then
-// whether modality is batch, and if it is batch then whether file IO is used
-func (dm *DirectiveMap) Config(name string) (bool, bool, bool) {
-	if config, present := dm.directives[name]; !present {
-		return false, false, false
-	} else if config == nil {
-		return true, false, false
-	} else {
-		return true, true, config.Files
-	}
+// Config returns (in-order) whether the directive is present, and if it is present
+// then whether it is a streaming (standard IO) or batch (file IO) configuration
+func (dm *DirectiveMap) Config(name string) (bool, bool) {
+	streaming, present := dm.directives[name]
+	return present, streaming
 }

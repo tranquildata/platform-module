@@ -5,7 +5,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -31,17 +30,27 @@ const UploadOnlyParamName = "uploadOnly"
 
 const DefaultMaximumOutputSize = 64 * 1024 * 1024 //64 MB
 
+var errModuleRunning = fmt.Errorf("module is already running; batch input must be staged before the module starts")
+var errInputClosed = fmt.Errorf("module input has already been closed")
+
 type ServiceInfo struct {
 	Directive string `json:"directive"`
-	Batch     bool   `json:"batch"`
+	Streaming bool   `json:"streaming"`
 }
 
 type APIService struct {
 	runtimeConfig     *config.RuntimeConfig
-	batch             bool
-	fileIO            bool
+	streaming         bool
 	maximumOutputSize uint64
-	activeModule      module.Module
+	inputDirectory    string
+	outputDirectory   string
+	startFn           func(map[string]string, bool) (module.Module, error)
+
+	moduleLock   sync.Mutex //guards module start-up and input
+	activeModule module.Module
+	inputClosed  bool    //streaming case only, set once the module's standard-in is closed
+	stream       *stream //streaming case only, set when the module starts
+	shutdownOnce sync.Once
 
 	waitTimeout time.Duration
 	runID       atomic.Value
@@ -54,25 +63,25 @@ type APIService struct {
 }
 
 type output struct {
-	//fileIO case
-	outputFilenames []string //the list of output filenames
-	cursorLock      sync.Mutex
-	outputCursor    int //the spot in outputFilenames where the last output GET stopped (0 means no GET as yet, len(outputFilenames) means all output was sent)
+	//batch case
+	outputFilenames   []string //the list of output filenames
+	cursorLock        sync.Mutex
+	outputCursor      int    //the spot in outputFilenames where the last output GET stopped (0 means no GET as yet, len(outputFilenames) means all output was sent)
+	maximumOutputSize uint64 //the size at which to end an output page, 0 means no paging
 
-	//stdio case
+	//streaming case
 	outputBytes []byte
 
 	//both cases
-	maximumOutputSize uint64
-	err               error
+	err error
 }
 
 type OutputResponse struct {
-	Outputs      map[string][]byte `json:"outputs"`      //the set of output files, for stdout runs there will be one entry with the key of ""
+	Outputs      map[string][]byte `json:"outputs"`      //the set of output files, for streaming runs there will be one entry with the key of ""
 	CursorOffset int               `json:"cursorOffset"` //the offset at which to start the next output page, 0 means all output has been returned
 }
 
-func Setup(runtimeConfig *config.RuntimeConfig, batch bool, fileIO bool) *APIService {
+func Setup(runtimeConfig *config.RuntimeConfig, streaming bool) *APIService {
 	logger := slog.New(slog.NewTextHandler(
 		os.Stdout,
 		&slog.HandlerOptions{
@@ -80,13 +89,15 @@ func Setup(runtimeConfig *config.RuntimeConfig, batch bool, fileIO bool) *APISer
 		}))
 	return &APIService{
 		runtimeConfig:     runtimeConfig,
-		batch:             batch,
-		fileIO:            fileIO,
+		streaming:         streaming,
 		logger:            logger,
 		waitTimeout:       1 * time.Second,
 		maximumOutputSize: DefaultMaximumOutputSize,
-		moduleChannel:     make(chan error),
-		shutdownChannel:   make(chan any),
+		inputDirectory:    InputDirectoryPath,
+		outputDirectory:   OutputDirectoryPath,
+		startFn:           module.Start,
+		moduleChannel:     make(chan error, 1),
+		shutdownChannel:   make(chan any, 1),
 		outputChannel:     make(chan *output),
 	}
 }
@@ -162,6 +173,8 @@ func (apis *APIService) registerHTTPEndpoints(mux *http.ServeMux) {
 	mux.HandleFunc("HEAD /{$}", apis.status)
 	mux.HandleFunc("OPTIONS /", apis.serviceInfo)
 	mux.HandleFunc("PUT /", apis.inputData)
+	mux.HandleFunc("GET /{$}", apis.streamOutput)      //streaming only, collects any output produced since the last call
+	mux.HandleFunc("DELETE /{$}", apis.closeInput)     //streaming only, closes standard-in and collects any output
 	mux.HandleFunc("OPTIONS /async", apis.serviceInfo) //synchronous, waits for output
 	mux.HandleFunc("PUT /async", apis.asyncInputData)
 	mux.HandleFunc("GET /async", apis.asyncGetOutput)
@@ -182,11 +195,15 @@ func (apis *APIService) serviceInfo(w http.ResponseWriter, r *http.Request) {
 func (apis *APIService) serviceMap() *ServiceInfo {
 	return &ServiceInfo{
 		Directive: apis.runtimeConfig.Directive,
-		Batch:     apis.batch,
+		Streaming: apis.streaming,
 	}
 }
 
 func (apis *APIService) asyncInputData(w http.ResponseWriter, r *http.Request) {
+	if apis.streaming {
+		http.Error(w, "async input is only supported for batch directives", http.StatusBadRequest)
+		return
+	}
 	var runId string
 	if runIds, OK := r.URL.Query()[RunIdParamName]; OK && len(runIds) > 0 {
 		runId = runIds[0]
@@ -210,7 +227,7 @@ func (apis *APIService) asyncInputData(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to read input: "+err.Error(), http.StatusBadRequest)
 		return
 	} else if err = apis.handleInput(append(bodyBytes, '\n'), !uploadOnly); err != nil {
-		http.Error(w, "failed to provide input to module: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "failed to provide input to module: "+err.Error(), inputErrorStatus(err))
 		return
 	}
 	apis.runID.Store(runId)
@@ -225,6 +242,10 @@ func (apis *APIService) asyncInputData(w http.ResponseWriter, r *http.Request) {
 }
 
 func (apis *APIService) asyncGetOutput(w http.ResponseWriter, r *http.Request) {
+	if apis.streaming {
+		http.Error(w, "async output is only supported for batch directives", http.StatusBadRequest)
+		return
+	}
 	var runId string
 	if runIds, OK := r.URL.Query()[RunIdParamName]; OK && len(runIds) > 0 {
 		runId = runIds[0]
@@ -272,7 +293,7 @@ func (apis *APIService) asyncGetOutput(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if len(out.outputFilenames) > 0 {
 		//output is present, fetch the next page
-		if responseBytes, err := out.responseBytes(OutputDirectoryPath); err != nil {
+		if responseBytes, err := out.responseBytes(apis.outputDirectory); err != nil {
 			http.Error(w, "failed to encode module output: "+err.Error(), http.StatusInternalServerError)
 			return
 		} else {
@@ -284,28 +305,36 @@ func (apis *APIService) asyncGetOutput(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// inputData provides input to the module. For batch directives the input is a set of
+// files that are staged before the module is started, and the call blocks until the
+// module terminates and then returns the output files. For streaming directives the
+// input is written to the module's standard-in, and any output produced on standard-out
+// is returned. In both cases the service shuts down once the module has terminated
+// and all of its output has been returned.
 func (apis *APIService) inputData(w http.ResponseWriter, r *http.Request) {
-	// NOTE: we're currently only supporting batch oprerations, so this routine will
-	// always trigger shutdown, but that will need to be re-visited when we add
-	// support for interactive modules
-	defer func() {
-		//this will shut things down messily. Any buffered I/O will be lost, so we need to be sure to
-		// flush anything before shutting down
-		apis.shutdownChannel <- nil
-	}()
+	if apis.streaming {
+		apis.streamInputData(w, r)
+		return
+	}
+
+	// batch runs are complete after a single call, so this routine always triggers shutdown
+	defer apis.requestShutdown()
 
 	if bodyBytes, err := io.ReadAll(r.Body); err != nil {
 		http.Error(w, "failed to read input: "+err.Error(), http.StatusBadRequest)
 		return
 	} else if err = apis.handleInput(append(bodyBytes, '\n'), true); err != nil {
-		http.Error(w, "failed to provide input to module: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "failed to provide input to module: "+err.Error(), inputErrorStatus(err))
 		return
 	}
 
-	if outs := apis.handleOutput(); outs.err != nil {
+	outs := apis.handleOutput()
+	// this is the only chance to return output before shutdown, so return all of it
+	outs.maximumOutputSize = 0
+	if outs.err != nil {
 		http.Error(w, "failed to get output from module: "+outs.err.Error(), http.StatusInternalServerError)
 		return
-	} else if responseBytes, err := outs.responseBytes(OutputDirectoryPath); err != nil {
+	} else if responseBytes, err := outs.responseBytes(apis.outputDirectory); err != nil {
 		http.Error(w, "failed to encode module output: "+err.Error(), http.StatusInternalServerError)
 		return
 	} else {
@@ -313,12 +342,99 @@ func (apis *APIService) inputData(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (apis *APIService) streamInputData(w http.ResponseWriter, r *http.Request) {
+	if bodyBytes, err := io.ReadAll(r.Body); err != nil {
+		http.Error(w, "failed to read input: "+err.Error(), http.StatusBadRequest)
+		return
+	} else if err = apis.handleInput(append(bodyBytes, '\n'), true); err != nil {
+		http.Error(w, "failed to provide input to module: "+err.Error(), inputErrorStatus(err))
+		return
+	}
+	apis.writeStreamOutput(w)
+}
+
+// streamOutput returns any output the streaming module has produced since the
+// last call, without providing new input.
+func (apis *APIService) streamOutput(w http.ResponseWriter, r *http.Request) {
+	if !apis.streaming {
+		http.Error(w, "output without input is only supported for streaming directives", http.StatusBadRequest)
+		return
+	}
+	apis.moduleLock.Lock()
+	s := apis.stream
+	apis.moduleLock.Unlock()
+	if s == nil {
+		http.Error(w, "module has not been started", http.StatusBadRequest)
+		return
+	}
+	apis.writeStreamOutput(w)
+}
+
+// writeStreamOutput waits (up to the wait timeout) for the streaming module to
+// produce output, and returns whatever is available. Once the module has terminated
+// and all of its output has been returned, shutdown is requested.
+func (apis *APIService) writeStreamOutput(w http.ResponseWriter) {
+	outs, finished := apis.stream.collect(apis.waitTimeout)
+	if finished {
+		apis.requestShutdown()
+	}
+	if outs.err != nil && len(outs.outputBytes) == 0 {
+		http.Error(w, "module failed: "+outs.err.Error(), http.StatusInternalServerError)
+	} else if responseBytes, err := outs.responseBytes(apis.outputDirectory); err != nil {
+		http.Error(w, "failed to encode module output: "+err.Error(), http.StatusInternalServerError)
+	} else {
+		w.Write(responseBytes) //nolint:errcheck
+	}
+}
+
+// closeInput closes the streaming module's standard-in, signaling that no more
+// input will be provided, and returns any output as streamOutput does. Closing
+// input that is already closed has no further effect.
+func (apis *APIService) closeInput(w http.ResponseWriter, r *http.Request) {
+	if !apis.streaming {
+		http.Error(w, "closing input is only supported for streaming directives", http.StatusBadRequest)
+		return
+	}
+	apis.moduleLock.Lock()
+	if apis.activeModule == nil {
+		apis.moduleLock.Unlock()
+		http.Error(w, "module has not been started", http.StatusBadRequest)
+		return
+	}
+	var err error
+	if !apis.inputClosed {
+		apis.inputClosed = true
+		err = apis.activeModule.CloseInput()
+	}
+	apis.moduleLock.Unlock()
+	if err != nil {
+		http.Error(w, "failed to close module input: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	apis.writeStreamOutput(w)
+}
+
+func inputErrorStatus(err error) int {
+	if err == errModuleRunning || err == errInputClosed {
+		return http.StatusConflict
+	}
+	return http.StatusInternalServerError
+}
+
+// requestShutdown signals Serve to shut down the service. It never blocks, and
+// only the first request has any effect.
+func (apis *APIService) requestShutdown() {
+	apis.shutdownOnce.Do(func() {
+		apis.shutdownChannel <- nil
+	})
+}
+
 func (o *output) responseBytes(outputDirectory string) ([]byte, error) {
 	resp := &OutputResponse{
 		Outputs: make(map[string][]byte, len(o.outputFilenames)+1),
 	}
 	var err error
-	if o.outputBytes != nil {
+	if o.outputFilenames == nil {
 		resp.Outputs[""] = o.outputBytes
 	} else if resp.Outputs, resp.CursorOffset, err = o.fileMap(outputDirectory); err != nil {
 		return nil, err
@@ -340,7 +456,7 @@ func (o *output) fileMap(outputDirectory string) (map[string][]byte, int, error)
 			outputs[filename] = fileBytes
 			currentSize += len(fileBytes)
 		}
-		if currentSize >= int(o.maximumOutputSize) {
+		if o.maximumOutputSize > 0 && currentSize >= int(o.maximumOutputSize) {
 			break
 		}
 	}
@@ -352,30 +468,36 @@ func (o *output) fileMap(outputDirectory string) (map[string][]byte, int, error)
 	return outputs, o.outputCursor, nil
 }
 
-// handleInput routes data to the module. If the module hasn't been started yet
-// then this routine will start the module. If the module expects file input
-// then this routine will write the input to the well-known input file before
-// starting the module.
+// handleInput routes data to the module. For batch directives the input is a JSON
+// map of files that are written to the input directory, and the module is started
+// (if requested) once they are staged. For streaming directives the module is
+// started if it isn't already running, and the input is written to standard-in.
 func (apis *APIService) handleInput(inputBytes []byte, startModule bool) error {
-	// if there is no running module, start it now
-	if apis.activeModule == nil {
-		// if we're running in FileIO mode then write the file first
-		if apis.fileIO {
-			if err := handleFileInput(inputBytes, InputDirectoryPath); err != nil {
-				return err
-			}
+	apis.moduleLock.Lock()
+	defer apis.moduleLock.Unlock()
+
+	if !apis.streaming {
+		if apis.activeModule != nil {
+			return errModuleRunning
+		}
+		if err := handleFileInput(inputBytes, apis.inputDirectory); err != nil {
+			return err
 		}
 		if startModule {
-			if err := apis.startModule(); err != nil {
-				return err
-			}
+			return apis.startModule()
 		}
+		return nil
 	}
 
-	if !apis.fileIO {
-		return apis.activeModule.Write(inputBytes)
+	if apis.activeModule == nil {
+		if err := apis.startModule(); err != nil {
+			return err
+		}
 	}
-	return nil
+	if apis.inputClosed {
+		return errInputClosed
+	}
+	return apis.activeModule.Write(inputBytes)
 }
 
 func handleFileInput(inputBytes []byte, inputDirectory string) error {
@@ -397,16 +519,25 @@ func handleFileInput(inputBytes []byte, inputDirectory string) error {
 }
 
 // startModule attempts to start the module via the wrapper script, communicating
-// the channel listener either the new module or failure
+// the channel listener either the new module or failure. For streaming directives
+// this also starts collecting the module's standard-out. The caller must hold the
+// moduleLock.
 func (apis *APIService) startModule() error {
-	activeModule, err := module.Start(apis.runtimeConfig.Environment())
+	activeModule, err := apis.startFn(apis.runtimeConfig.Environment(), apis.streaming)
 	if err != nil {
 		apis.logger.Error("module started with error", "error", err)
 	} else {
 		apis.logger.Debug("module started")
+		apis.activeModule = activeModule
+		if apis.streaming {
+			apis.stream = newStream()
+			go apis.stream.pump(activeModule, apis.logger, apis.requestShutdown)
+		}
 	}
-	apis.activeModule = activeModule
-	apis.moduleChannel <- err
+	select {
+	case apis.moduleChannel <- err:
+	default:
+	}
 	return err
 }
 
@@ -416,67 +547,44 @@ func (apis *APIService) handleOutputAsync(outputCh chan *output) {
 }
 
 func (apis *APIService) handleOutput() *output {
-	outputFilenames, outputBytes, err := apis.handleFullOutput()
+	outputFilenames, err := apis.handleFullOutput()
 	return &output{
 		outputFilenames:   outputFilenames,
 		outputCursor:      0,
-		outputBytes:       outputBytes,
 		maximumOutputSize: apis.maximumOutputSize,
 		err:               err,
 	}
 }
 
-// handleFullOutput retrieves the final data output from the module. This routine will
-// Wait() on the module before returning.
-func (apis *APIService) handleFullOutput() ([]string, []byte, error) {
-	if apis.fileIO {
-		apis.logger.Debug("using fileIO")
-		// wait for the module to complete to ensure all files are written
-		if err := apis.activeModule.WaitForStop(); err != nil {
-			apis.logger.Error("waitForStop error", "error", err)
-			buffer := bytes.Buffer{}
-			if _, readErr := apis.activeModule.ReadFully(&buffer); readErr != nil {
-				apis.logger.Error("error reading command output", "error", readErr)
-			}
-			return nil, nil, err
-		}
-
-		// marshal up all the file contents into a map
-		if outputRunDirs, err := os.ReadDir(OutputDirectoryPath); err != nil {
-			apis.logger.Error("readDir error", "error", err)
-			return nil, nil, err
-		} else {
-			names := make([]string, len(outputRunDirs))[0:0]
-			for _, entry := range outputRunDirs {
-				if !entry.IsDir() {
-					names = append(names, entry.Name())
-				} else {
-					if runFiles, err := os.ReadDir(path.Join(OutputDirectoryPath, entry.Name())); err != nil {
-						return nil, nil, err
-					} else {
-						for _, runEntry := range runFiles {
-							names = append(names, path.Join(entry.Name(), runEntry.Name()))
-						}
-					}
-				}
-			}
-			if apis.logger.Enabled(context.Background(), slog.LevelDebug) {
-				apis.logger.Debug("output files", "fileList", strings.Join(names, ","))
-			}
-			return names, nil, nil
-		}
-	} else {
-		// read all output until there's nothing left, and put that into a single entry
-		// with an empty name to signal this was standard-out not a named file
-		var buffer bytes.Buffer
-		if _, err := apis.activeModule.ReadFully(&buffer); err != nil {
-			return nil, nil, err
-		}
-		// for parity with the fileIO version, wait for the module to terminate, which
-		// should be instant since stdout is already closed
-		if err := apis.activeModule.WaitForStop(); err != nil {
-			return nil, nil, err
-		}
-		return nil, buffer.Bytes(), nil
+// handleFullOutput retrieves the names of all files the batch module wrote to the
+// output directory. This routine will Wait() on the module before returning.
+func (apis *APIService) handleFullOutput() ([]string, error) {
+	// wait for the module to complete to ensure all files are written
+	if err := apis.activeModule.WaitForStop(); err != nil {
+		apis.logger.Error("waitForStop error", "error", err)
+		return nil, err
 	}
+
+	// collect the names of all output files, including those one level down in run directories
+	outputRunDirs, err := os.ReadDir(apis.outputDirectory)
+	if err != nil {
+		apis.logger.Error("readDir error", "error", err)
+		return nil, err
+	}
+	names := make([]string, 0, len(outputRunDirs))
+	for _, entry := range outputRunDirs {
+		if !entry.IsDir() {
+			names = append(names, entry.Name())
+		} else if runFiles, err := os.ReadDir(path.Join(apis.outputDirectory, entry.Name())); err != nil {
+			return nil, err
+		} else {
+			for _, runEntry := range runFiles {
+				names = append(names, path.Join(entry.Name(), runEntry.Name()))
+			}
+		}
+	}
+	if apis.logger.Enabled(context.Background(), slog.LevelDebug) {
+		apis.logger.Debug("output files", "fileList", strings.Join(names, ","))
+	}
+	return names, nil
 }

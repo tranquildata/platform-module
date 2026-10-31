@@ -15,24 +15,23 @@ Note that you should you not change any of the API code to stage your module. If
 
 ## Module Definitions ##
 
-In Step 1 above, you edit the `directives.json` file to define the behavior of your module. This is a `json` file of the form:
+In Step 1 above, the `directives.json` file defines the behavior of a module. This is a `json` file of the form:
 
 ```json
 [
     {
         "name": "DIRECTIVE NAME",
-        "batch": {
-            "files": false,
-        }
+        "streaming": false
     }
 ]
 ```
 
-Each entry in this list defines a way that the module can be invoked. The `DIRECTIVE NAME` is a unique way to invoke your module. If this directive runs interactively, then you omit the `batch` element. If the directive runs in a batch-mode (accepts input, returns output and then shuts down) you include `batch` and specify the IO type you want with the `files` attribute.
+Each entry in this list defines a uniquely named configuration to run a module. The `DIRECTIVE NAME` must be unique within the file. If `streaming` is true, then this is an interactive configuration that supports sustained input and output. Otherwise, the configuration is batch-oriented: it takes an arbitrary number of inputs, returns the associated outputs, and then shuts down.
 
-Your module can do IO in one of two ways. In batch-mode, it can accept a single file as input and write any number of files as output. This is what happens when `files` is set to `true`. The input file will be `/moduleio/input` and any output files should be written to `/mooduleio/output`. When an API call is made to the container, the input file is written with the API input, and the your module is started. The API service waits for your module to terminate, and returns all files from the output directory.
+Your module can do IO in one of two ways:
 
-In interactive-mode, or in batch-mode when `files` is set to `false`, standard input and output is used. For each API call with input data your module can read the input via standard-in. Similarly, any output from your module shuold be written to standard-out. In batch-mode, an input API call will read all output from the module until EOF is reached (meaning that your module has terminated) before returning data to the caller.
+1. Batch configurations accept one or more input files and write one or more output files. The inputs files will be mounted into the container at `/moduleio/input` and the output files should be written to `/moduleio/output`. All input files will be staged before module code is started. The Golang API service waits for your module to terminate, and then returns all files from the output directory. Anything your module writes to standard-out or standard-err goes to the container log.
+2. Interactive configurations use standard input and output. For each API call with input data your module can read the input via standard-in. Similarly, any output from your module is written to standard-out. Neither direction blocks the other. Standard-in stays open until the caller closes it (see below), so a module that reads until end-of-input will wait for that signal.
 
 Here's an example:
 
@@ -40,18 +39,18 @@ Here's an example:
 [
     {
         "name": "montecarlo",
-        "batch": {
-            "files": true
-        }
+        "streaming": false
     }
 ]
 ```
 
-This definition says that your module can be invoked with the directive `montecarlo` and will run in batch-mode expecting an input file and writing out a collection of output files before terminating. The environment variable `MODULE_DIRECTIVE` is available to the wrpper script and your module, so if you decide to define multiple directives within a module you know what you are being called to run.
+This definition says that your module can be invoked with the directive `montecarlo` and will run as a batch configuration, expecting input files, doing some work, and writing output files before terminating. The environment variable `MODULE_DIRECTIVE` is available to the wrpper script and your module, so if you decide to define multiple directives within a module you know what you are being called to run.
+
+The API service will refuse to start if `directives.json` contains duplicate or missing names, or any fields other than `name` and `streaming`.
 
 ## Container Runtime ##
 
-The container that you build with this project will be started on-demand when customer API calls to the Data Platform ask to run this module. When a container instance is started, it is given a single directive as an environment variable. A simple API front-end server (see the `api` directory) is started, and it listens for input to provide the appropriate IO pattern expected by the module code. The API service keeps the module implementation both cloud and platform neutral, and isolated from policy, security, storage, audit, etc.
+When a container instance is started, it is given a single directive as an environment variable. A simple API front-end server (see the `api` directory) is started, and it listens for input to provide the appropriate IO pattern expected by the module code. The API service keeps the module implementation both cloud and platform neutral, and isolated from policy, security, storage, audit, etc.
 
 You can test that you've built your module container correctly by running it and providing input via API. For instance, if you build the vanilla container by checking out this repository and simply running step 4 above, you can then run:
 
@@ -61,4 +60,48 @@ docker run -e MODULE_DIRECTIVE=hello -p 8080:80 "tranquildata/platform-module" s
 
 You now have a container instance running with the local port `8080` accessible. You can test this by running `curl -I "http://localhost:8080"` and you should see `HTTP/1.1 200 OK`.
 
-To give the module input, run `curl -X PUT "http://localhost:8080" -d 'alice'`. The module will process the input "alice" and return the value "hello alice" that is base64-encoded before being returned to the API caller. Because this is a batch-mode module directive, as soon as the return value is provided the module terminates, then the API server shuts down and the container instance exits. 
+To give the module input, run `curl -X PUT "http://localhost:8080" -d 'alice'`. The module will process the input "alice" and return the base64-encoded value "hello alice". This example module directive will shut down the container instance as soon as it has responded to this message.
+
+## API Reference ##
+
+All endpoints are on the root path of the container's API port. These endpoints are available in every configuration:
+
+* `HEAD /` returns `200 OK` once the API service is running.
+* `OPTIONS /` returns the configuration as JSON, for example `{"directive": "hello", "streaming": true}`.
+
+Calls that return module output use this JSON form, where each value is base64-encoded:
+
+```json
+{
+    "outputs": {
+        "OUTPUT NAME": "BASE64 CONTENT"
+    },
+    "cursorOffset": 0
+}
+```
+
+For batch configurations each key is the path of an output file, relative to `/moduleio/output`. Files at the top level and one directory down are returned. For streaming configurations there is a single entry whose key is the empty string `""`.
+
+### Batch Configurations ###
+
+Input is a JSON object that maps each input file name to its base64-encoded content, for example `{"input01.csv": "Zmlyc3Q="}`.
+
+* `PUT /` stages the input files, starts the module, waits for it to terminate, and returns all of the output files in a single response. The container then shuts down.
+
+For long-running modules, or inputs too large for a single call, use the asynchronous endpoints. Each takes a `runId` query parameter that you choose, and every call must use the same `runId`.
+
+* `PUT /async?runId=ID&uploadOnly=true` stages input files without starting the module. You can call this as many times as you need.
+* `PUT /async?runId=ID` stages any input files in the body and then starts the module. It returns immediately with the `runId`.
+* `GET /async?runId=ID` collects the output. It returns `504` while the module is still running, so retry until it doesn't. Output is returned in pages of about 64 MB. A non-zero `cursorOffset` means more output remains, so call again for the next page. `204` means the module finished without writing any output files.
+
+Input that arrives after the module has started is rejected with `409`. Unlike `PUT /`, the asynchronous endpoints do not shut down the container when the run completes.
+
+### Streaming Configurations ###
+
+* `PUT /` writes the request body, followed by a newline, to the module's standard-in. The first call starts the module. It returns the output that is ready. If none is ready yet, it waits up to one second for some.
+* `GET /` returns any output the module has produced since the last call, without sending input. It waits the same way as `PUT /`.
+* `DELETE /` closes the module's standard-in so that the module sees end-of-input, and then returns output the same way as `GET /`. After this, `PUT /` returns `409`.
+
+Because output is collected independently of input, a response contains whatever output is ready when it is sent. That may not be the response to that call's own input. Use `GET /` to collect output that arrives later.
+
+When the module terminates and all of its output has been returned, the container shuts down. If the module exits with an error and has no remaining output, the call returns `500`.
