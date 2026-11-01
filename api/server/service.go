@@ -27,6 +27,7 @@ const InputDirectoryPath = "/moduleio/input"
 const OutputDirectoryPath = "/moduleio/output"
 const RunIdParamName = "runId"
 const UploadOnlyParamName = "uploadOnly"
+const DirectiveParamName = "directive"
 
 const DefaultMaximumOutputSize = 64 * 1024 * 1024 //64 MB
 const DefaultCollectionTimeout = 20 * time.Minute
@@ -41,6 +42,7 @@ type ServiceInfo struct {
 
 type APIService struct {
 	runtimeConfig     *config.RuntimeConfig
+	directives        *module.DirectiveMap
 	streaming         bool
 	maximumOutputSize uint64
 	inputDirectory    string
@@ -86,7 +88,10 @@ type OutputResponse struct {
 	CursorOffset int               `json:"cursorOffset"` //the offset at which to start the next output page, 0 means all output has been returned
 }
 
-func Setup(runtimeConfig *config.RuntimeConfig, streaming bool) *APIService {
+// Setup creates the API service for the directive in the runtime configuration,
+// which the caller must have checked is present in the directives.
+func Setup(runtimeConfig *config.RuntimeConfig, directives *module.DirectiveMap) *APIService {
+	_, streaming := directives.Config(runtimeConfig.Directive)
 	logger := slog.New(slog.NewTextHandler(
 		os.Stdout,
 		&slog.HandlerOptions{
@@ -94,6 +99,7 @@ func Setup(runtimeConfig *config.RuntimeConfig, streaming bool) *APIService {
 		}))
 	return &APIService{
 		runtimeConfig:     runtimeConfig,
+		directives:        directives,
 		streaming:         streaming,
 		logger:            logger,
 		waitTimeout:       1 * time.Second,
@@ -158,6 +164,11 @@ func (apis *APIService) Serve(port uint16) error {
 		apis.logger.Debug("no error starting up the module")
 
 	case <-timeout.C:
+		if !apis.hasDirective() {
+			// without a directive no module can start, so this window is the expected lifetime
+			apis.logger.Info("no directive configured; exiting service after timeout window")
+			return apis.shutdownServer(httpServer)
+		}
 		// we waited too long for API interaction so clean up
 		apis.logger.Error("interaction timeout")
 		return fmt.Errorf("no interaction after timeout window; exiting service")
@@ -168,6 +179,10 @@ func (apis *APIService) Serve(port uint16) error {
 	<-apis.shutdownChannel
 
 	apis.logger.Debug("got shutdown signal")
+	return apis.shutdownServer(httpServer)
+}
+
+func (apis *APIService) shutdownServer(httpServer *http.Server) error {
 	// finish by running a graceful shutdown of the web server, which will block
 	// until any outstanding exchanges wrap up
 	ctx, cancel := context.WithDeadline(context.TODO(), time.Now().Add(time.Second*30))
@@ -178,22 +193,65 @@ func (apis *APIService) Serve(port uint16) error {
 func (apis *APIService) registerHTTPEndpoints(mux *http.ServeMux) {
 	mux.HandleFunc("HEAD /{$}", apis.status)
 	mux.HandleFunc("OPTIONS /", apis.serviceInfo)
-	mux.HandleFunc("PUT /", apis.inputData)
-	mux.HandleFunc("GET /{$}", apis.streamOutput)      //streaming only, collects any output produced since the last call
-	mux.HandleFunc("DELETE /{$}", apis.closeInput)     //streaming only, closes standard-in and collects any output
-	mux.HandleFunc("OPTIONS /async", apis.serviceInfo) //synchronous, waits for output
-	mux.HandleFunc("PUT /async", apis.asyncInputData)
-	mux.HandleFunc("GET /async", apis.asyncGetOutput)
+	mux.HandleFunc("GET /parameters", apis.parameters)
+	mux.HandleFunc("PUT /", apis.requireDirective(apis.inputData))
+	mux.HandleFunc("GET /{$}", apis.requireDirective(apis.streamOutput))      //streaming only, collects any output produced since the last call
+	mux.HandleFunc("DELETE /{$}", apis.requireDirective(apis.closeInput))     //streaming only, closes standard-in and collects any output
+	mux.HandleFunc("OPTIONS /async", apis.requireDirective(apis.serviceInfo)) //synchronous, waits for output
+	mux.HandleFunc("PUT /async", apis.requireDirective(apis.asyncInputData))
+	mux.HandleFunc("GET /async", apis.requireDirective(apis.asyncGetOutput))
+}
+
+// hasDirective returns whether the service was started with a directive. Without
+// one, the service only describes the configured directives.
+func (apis *APIService) hasDirective() bool {
+	return apis.runtimeConfig != nil && apis.runtimeConfig.Directive != ""
+}
+
+// requireDirective rejects calls that need a running directive when none is configured.
+func (apis *APIService) requireDirective(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !apis.hasDirective() {
+			http.Error(w, "no directive is configured; only HEAD /, OPTIONS / and GET /parameters are available", http.StatusBadRequest)
+			return
+		}
+		handler(w, r)
+	}
 }
 
 func (apis *APIService) status(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// serviceInfo describes the configured directive or, if there is none, all directives.
 func (apis *APIService) serviceInfo(w http.ResponseWriter, r *http.Request) {
-	if responseBytes, err := json.Marshal(apis.serviceMap()); err != nil {
+	var info any = apis.serviceMap()
+	if !apis.hasDirective() {
+		info = apis.allServiceMaps()
+	}
+	if responseBytes, err := json.Marshal(info); err != nil {
 		http.Error(w, "failed to marshal service info"+err.Error(), http.StatusInternalServerError)
 	} else {
+		w.Write(responseBytes) //nolint:errcheck
+	}
+}
+
+// parameters returns the parameters defined for the directive named in the query.
+func (apis *APIService) parameters(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get(DirectiveParamName)
+	if name == "" {
+		http.Error(w, fmt.Sprintf("missing %s query parameter", DirectiveParamName), http.StatusBadRequest)
+		return
+	}
+	parameters, present := apis.directives.Parameters(name)
+	if !present {
+		http.Error(w, fmt.Sprintf("unknown directive %s", name), http.StatusNotFound)
+		return
+	}
+	if responseBytes, err := json.Marshal(parameters); err != nil {
+		http.Error(w, "failed to marshal parameters: "+err.Error(), http.StatusInternalServerError)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
 		w.Write(responseBytes) //nolint:errcheck
 	}
 }
@@ -203,6 +261,18 @@ func (apis *APIService) serviceMap() *ServiceInfo {
 		Directive: apis.runtimeConfig.Directive,
 		Streaming: apis.streaming,
 	}
+}
+
+func (apis *APIService) allServiceMaps() []ServiceInfo {
+	directives := apis.directives.Directives()
+	infos := make([]ServiceInfo, len(directives))
+	for idx, directive := range directives {
+		infos[idx] = ServiceInfo{
+			Directive: directive.Name,
+			Streaming: directive.Streaming,
+		}
+	}
+	return infos
 }
 
 func (apis *APIService) asyncInputData(w http.ResponseWriter, r *http.Request) {

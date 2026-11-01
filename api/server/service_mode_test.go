@@ -67,7 +67,17 @@ func (fm *fakeModule) CloseInput() error {
 }
 
 func testService(t *testing.T, streaming bool, run func(stdin io.Reader, stdout io.Writer) error) (*APIService, *http.ServeMux) {
-	apis := Setup(&config.RuntimeConfig{Directive: "test"}, streaming)
+	directives, err := module.Parse([]byte(fmt.Sprintf(`[
+		{"name": "test", "streaming": %t},
+		{"name": "tuned", "parameters": [
+			{"name": "iterations", "required": true},
+			{"name": "tolerance", "default": 0.25}
+		]}
+	]`, streaming)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	apis := Setup(&config.RuntimeConfig{Directive: "test"}, directives)
 	apis.waitTimeout = 100 * time.Millisecond
 	apis.inputDirectory = t.TempDir()
 	apis.outputDirectory = t.TempDir()
@@ -126,6 +136,83 @@ func Test_thatOptionsReportsMode(t *testing.T) {
 			t.Fatal(err)
 		} else if info.Directive != "test" || info.Streaming != streaming {
 			t.Errorf("unexpected service info %+v", info)
+		}
+	}
+}
+
+func Test_thatNoDirectiveOnlyDescribesDirectives(t *testing.T) {
+	directives, err := module.Parse([]byte(`[
+		{"name": "hello", "streaming": true},
+		{"name": "montecarlo", "parameters": [{"name": "iterations", "required": true}]}
+	]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	apis := Setup(&config.RuntimeConfig{}, directives)
+	apis.startFn = func(_ map[string]string, _ bool) (module.Module, error) {
+		t.Error("module started without a directive")
+		return nil, fmt.Errorf("no directive")
+	}
+	mux := http.NewServeMux()
+	apis.registerHTTPEndpoints(mux)
+
+	allowed := []struct {
+		method string
+		target string
+		body   string
+	}{
+		{http.MethodHead, "/", ""},
+		{http.MethodOptions, "/", `[{"directive":"hello","streaming":true},{"directive":"montecarlo","streaming":false}]`},
+		{http.MethodGet, "/parameters?directive=montecarlo", `[{"name":"iterations","required":true}]`},
+	}
+	for _, c := range allowed {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(c.method, c.target, nil))
+		if w.Code != http.StatusOK {
+			t.Errorf("%s %s: unexpected status %d", c.method, c.target, w.Code)
+		} else if w.Body.String() != c.body {
+			t.Errorf("%s %s: expected %s, got %s", c.method, c.target, c.body, w.Body.String())
+		}
+	}
+
+	rejected := []struct {
+		method string
+		target string
+	}{
+		{http.MethodPut, "/"},
+		{http.MethodGet, "/"},
+		{http.MethodDelete, "/"},
+		{http.MethodOptions, "/async"},
+		{http.MethodPut, "/async?runId=1"},
+		{http.MethodGet, "/async?runId=1"},
+	}
+	for _, c := range rejected {
+		if code := callStatus(mux, c.method, c.target, "{}"); code != http.StatusBadRequest {
+			t.Errorf("%s %s: unexpected status %d", c.method, c.target, code)
+		}
+	}
+	expectShutdown(t, apis, false)
+}
+
+func Test_thatParametersAreReturned(t *testing.T) {
+	_, mux := testService(t, false, nil)
+	cases := []struct {
+		target string
+		status int
+		body   string
+	}{
+		{"/parameters?directive=tuned", http.StatusOK, `[{"name":"iterations","required":true},{"name":"tolerance","required":false,"default":0.25}]`},
+		{"/parameters?directive=test", http.StatusOK, `[]`},
+		{"/parameters?directive=unknown", http.StatusNotFound, ""},
+		{"/parameters", http.StatusBadRequest, ""},
+	}
+	for _, c := range cases {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, c.target, nil))
+		if w.Code != c.status {
+			t.Errorf("GET %s: expected %d, got %d", c.target, c.status, w.Code)
+		} else if c.status == http.StatusOK && w.Body.String() != c.body {
+			t.Errorf("GET %s: expected %s, got %s", c.target, c.body, w.Body.String())
 		}
 	}
 }

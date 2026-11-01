@@ -21,7 +21,14 @@ In Step 1 above, the `directives.json` file defines the behavior of a module. Th
 [
     {
         "name": "DIRECTIVE NAME",
-        "streaming": false
+        "streaming": false,
+        "parameters": [
+            {
+                "name": "PARAMETER NAME",
+                "required": false,
+                "default": 1.0
+            }
+        ]
     }
 ]
 ```
@@ -33,20 +40,32 @@ Your module can do IO in one of two ways:
 1. Batch configurations accept one or more input files and write one or more output files. The inputs files will be mounted into the container at `/moduleio/input` and the output files should be written to `/moduleio/output`. All input files will be staged before module code is started. The Golang API service waits for your module to terminate, and then returns all files from the output directory. Anything your module writes to standard-out or standard-err goes to the container log.
 2. Interactive configurations use standard input and output. For each API call with input data your module can read the input via standard-in. Similarly, any output from your module is written to standard-out. Neither direction blocks the other. Standard-in stays open until the caller closes it (see below), so a module that reads until end-of-input will wait for that signal.
 
+A directive can optionally declare the numeric parameters it accepts in `parameters`. Each parameter has a `name`, which is required and must be unique within the directive. `required` is optional and defaults to `false`. `default` is optional, is a number, and is omitted when the parameter has no default. Callers can look up a directive's parameters with `GET /parameters` (see the API reference below).
+
 Here's an example:
 
 ```json
 [
     {
         "name": "montecarlo",
-        "streaming": false
+        "streaming": false,
+        "parameters": [
+            {
+                "name": "iterations",
+                "required": true
+            },
+            {
+                "name": "tolerance",
+                "default": 0.05
+            }
+        ]
     }
 ]
 ```
 
-This definition says that your module can be invoked with the directive `montecarlo` and will run as a batch configuration, expecting input files, doing some work, and writing output files before terminating. The environment variable `MODULE_DIRECTIVE` is available to the wrpper script and your module, so if you decide to define multiple directives within a module you know what you are being called to run.
+This definition says that your module can be invoked with the directive `montecarlo` and will run as a batch configuration, expecting input files, doing some work, and writing output files before terminating. It declares a required `iterations` parameter and an optional `tolerance` parameter that defaults to `0.05`. The environment variable `MODULE_DIRECTIVE` is available to the wrpper script and your module, so if you decide to define multiple directives within a module you know what you are being called to run.
 
-The API service will refuse to start if `directives.json` contains duplicate or missing names, or any fields other than `name` and `streaming`.
+The API service will refuse to start if `directives.json` contains duplicate or missing directive or parameter names, or any fields other than those described above.
 
 ## Container Runtime ##
 
@@ -62,12 +81,20 @@ You now have a container instance running with the local port `8080` accessible.
 
 To give the module input, run `curl -X PUT "http://localhost:8080" -d 'alice'`. The module will process the input "alice" and return the base64-encoded value "hello alice". This example module directive will shut down the container instance as soon as it has responded to this message.
 
+You can also start a container without setting `MODULE_DIRECTIVE`. The module is never started, and the container only describes its directives: `HEAD /`, `OPTIONS /` and `GET /parameters` are available, and every other call returns `400`. The container shuts down after 20 minutes. For example:
+
+```bash
+docker run -p 8080:80 "tranquildata/platform-module" start
+curl -X OPTIONS "http://localhost:8080"
+```
+
 ## API Reference ##
 
 All endpoints are on the root path of the container's API port. These endpoints are available in every configuration:
 
 * `HEAD /` returns `200 OK` once the API service is running.
-* `OPTIONS /` returns the configuration as JSON, for example `{"directive": "hello", "streaming": true}`.
+* `OPTIONS /` returns the configuration as JSON, for example `{"directive": "hello", "streaming": true}`. If no directive is set, it returns a JSON array with an entry of the same form for every directive, in the order they appear in `directives.json`, for example `[{"directive": "hello", "streaming": true}]`.
+* `GET /parameters?directive=NAME` returns the parameters declared for the directive `NAME` as a JSON array, for example `[{"name": "iterations", "required": true}, {"name": "tolerance", "required": false, "default": 0.05}]`. `NAME` can be any directive in `directives.json`, not only the one this container is running. A directive with no parameters returns `[]`. An unknown directive returns `404`.
 
 Calls that return module output use this JSON form, where each value is base64-encoded:
 
