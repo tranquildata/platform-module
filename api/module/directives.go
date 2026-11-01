@@ -16,6 +16,7 @@ const DirectivesFile = "/moduleio/directives.json"
 
 type DirectiveMap struct {
 	directives map[string]*Directive
+	ordered    []Directive //in the order defined in the file
 }
 
 type Directive struct {
@@ -73,6 +74,7 @@ func Parse(jsonBytes []byte) (*DirectiveMap, error) {
 
 	return &DirectiveMap{
 		directives: directiveMap,
+		ordered:    directives,
 	}, nil
 }
 
@@ -83,6 +85,13 @@ func (dm *DirectiveMap) Config(name string) (bool, bool) {
 		return true, directive.Streaming
 	}
 	return false, false
+}
+
+// Directives returns all directives in the order they are defined.
+func (dm *DirectiveMap) Directives() []Directive {
+	directives := make([]Directive, len(dm.ordered))
+	copy(directives, dm.ordered)
+	return directives
 }
 
 // Parameters returns (in-order) the parameters defined for the directive, which

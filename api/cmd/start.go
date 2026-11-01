@@ -50,7 +50,8 @@ func runStartCommand(port uint16) {
 		fmt.Printf("failed to load module directives: %s\n", err.Error())
 		return
 	}
-	if present, _ := directiveMap.Config(runtimeConfig.Directive); !present {
+	// no directive means the service only describes the directives, so it can't be unknown
+	if present, _ := directiveMap.Config(runtimeConfig.Directive); runtimeConfig.Directive != "" && !present {
 		fmt.Printf("unknown module directive: %s\n", runtimeConfig.Directive)
 		return
 	}

@@ -76,6 +76,20 @@ func Test_thatParametersParse(t *testing.T) {
 	}
 }
 
+func Test_thatDirectivesKeepFileOrder(t *testing.T) {
+	dm, err := Parse([]byte(`[{"name": "c", "streaming": true}, {"name": "a"}, {"name": "b"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, directive := range dm.Directives() {
+		names = append(names, directive.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"c", "a", "b"}) {
+		t.Errorf("unexpected order %v", names)
+	}
+}
+
 func Test_thatInvalidDirectivesFail(t *testing.T) {
 	cases := map[string]string{
 		"duplicate name":          `[{"name": "hello", "streaming": true}, {"name": "hello", "streaming": false}]`,

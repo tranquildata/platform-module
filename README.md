@@ -81,12 +81,19 @@ You now have a container instance running with the local port `8080` accessible.
 
 To give the module input, run `curl -X PUT "http://localhost:8080" -d 'alice'`. The module will process the input "alice" and return the base64-encoded value "hello alice". This example module directive will shut down the container instance as soon as it has responded to this message.
 
+You can also start a container without setting `MODULE_DIRECTIVE`. The module is never started, and the container only describes its directives: `HEAD /`, `OPTIONS /` and `GET /parameters` are available, and every other call returns `400`. The container shuts down after 20 minutes. For example:
+
+```bash
+docker run -p 8080:80 "tranquildata/platform-module" start
+curl -X OPTIONS "http://localhost:8080"
+```
+
 ## API Reference ##
 
 All endpoints are on the root path of the container's API port. These endpoints are available in every configuration:
 
 * `HEAD /` returns `200 OK` once the API service is running.
-* `OPTIONS /` returns the configuration as JSON, for example `{"directive": "hello", "streaming": true}`.
+* `OPTIONS /` returns the configuration as JSON, for example `{"directive": "hello", "streaming": true}`. If no directive is set, it returns a JSON array with an entry of the same form for every directive, in the order they appear in `directives.json`, for example `[{"directive": "hello", "streaming": true}]`.
 * `GET /parameters?directive=NAME` returns the parameters declared for the directive `NAME` as a JSON array, for example `[{"name": "iterations", "required": true}, {"name": "tolerance", "required": false, "default": 0.05}]`. `NAME` can be any directive in `directives.json`, not only the one this container is running. A directive with no parameters returns `[]`. An unknown directive returns `404`.
 
 Calls that return module output use this JSON form, where each value is base64-encoded:
