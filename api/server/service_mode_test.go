@@ -67,7 +67,17 @@ func (fm *fakeModule) CloseInput() error {
 }
 
 func testService(t *testing.T, streaming bool, run func(stdin io.Reader, stdout io.Writer) error) (*APIService, *http.ServeMux) {
-	apis := Setup(&config.RuntimeConfig{Directive: "test"}, streaming)
+	directives, err := module.Parse([]byte(fmt.Sprintf(`[
+		{"name": "test", "streaming": %t},
+		{"name": "tuned", "parameters": [
+			{"name": "iterations", "required": true},
+			{"name": "tolerance", "default": 0.25}
+		]}
+	]`, streaming)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	apis := Setup(&config.RuntimeConfig{Directive: "test"}, directives)
 	apis.waitTimeout = 100 * time.Millisecond
 	apis.inputDirectory = t.TempDir()
 	apis.outputDirectory = t.TempDir()
@@ -126,6 +136,29 @@ func Test_thatOptionsReportsMode(t *testing.T) {
 			t.Fatal(err)
 		} else if info.Directive != "test" || info.Streaming != streaming {
 			t.Errorf("unexpected service info %+v", info)
+		}
+	}
+}
+
+func Test_thatParametersAreReturned(t *testing.T) {
+	_, mux := testService(t, false, nil)
+	cases := []struct {
+		target string
+		status int
+		body   string
+	}{
+		{"/parameters?directive=tuned", http.StatusOK, `[{"name":"iterations","required":true},{"name":"tolerance","required":false,"default":0.25}]`},
+		{"/parameters?directive=test", http.StatusOK, `[]`},
+		{"/parameters?directive=unknown", http.StatusNotFound, ""},
+		{"/parameters", http.StatusBadRequest, ""},
+	}
+	for _, c := range cases {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, c.target, nil))
+		if w.Code != c.status {
+			t.Errorf("GET %s: expected %d, got %d", c.target, c.status, w.Code)
+		} else if c.status == http.StatusOK && w.Body.String() != c.body {
+			t.Errorf("GET %s: expected %s, got %s", c.target, c.body, w.Body.String())
 		}
 	}
 }

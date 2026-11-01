@@ -15,12 +15,19 @@ import (
 const DirectivesFile = "/moduleio/directives.json"
 
 type DirectiveMap struct {
-	directives map[string]bool
+	directives map[string]*Directive
 }
 
 type Directive struct {
-	Name      string `json:"name"`
-	Streaming bool   `json:"streaming"`
+	Name       string      `json:"name"`
+	Streaming  bool        `json:"streaming"`
+	Parameters []Parameter `json:"parameters,omitempty"`
+}
+
+type Parameter struct {
+	Name     string   `json:"name"`
+	Required bool     `json:"required"`
+	Default  *float64 `json:"default,omitempty"` //nil when no default is defined
 }
 
 // Load attempts to read & process the directives file.
@@ -33,8 +40,8 @@ func Load() (*DirectiveMap, error) {
 }
 
 // Parse processes the contents of a directives file. Unknown fields are rejected
-// so that files using an older syntax fail loudly rather than being misread, and
-// directive names must be unique.
+// so that files using an older syntax fail loudly rather than being misread.
+// Directive names must be unique, as must parameter names within a directive.
 func Parse(jsonBytes []byte) (*DirectiveMap, error) {
 	decoder := json.NewDecoder(bytes.NewReader(jsonBytes))
 	decoder.DisallowUnknownFields()
@@ -44,14 +51,24 @@ func Parse(jsonBytes []byte) (*DirectiveMap, error) {
 		return nil, fmt.Errorf("failed to process directives: %s", err.Error())
 	}
 
-	directiveMap := make(map[string]bool, len(directives))
-	for _, directive := range directives {
+	directiveMap := make(map[string]*Directive, len(directives))
+	for idx := range directives {
+		directive := &directives[idx]
 		if directive.Name == "" {
 			return nil, fmt.Errorf("failed to process directives: directive is missing a name")
 		} else if _, present := directiveMap[directive.Name]; present {
 			return nil, fmt.Errorf("failed to process directives: duplicate directive %s", directive.Name)
 		}
-		directiveMap[directive.Name] = directive.Streaming
+		parameterNames := make(map[string]bool, len(directive.Parameters))
+		for _, parameter := range directive.Parameters {
+			if parameter.Name == "" {
+				return nil, fmt.Errorf("failed to process directives: parameter of directive %s is missing a name", directive.Name)
+			} else if parameterNames[parameter.Name] {
+				return nil, fmt.Errorf("failed to process directives: duplicate parameter %s in directive %s", parameter.Name, directive.Name)
+			}
+			parameterNames[parameter.Name] = true
+		}
+		directiveMap[directive.Name] = directive
 	}
 
 	return &DirectiveMap{
@@ -62,6 +79,20 @@ func Parse(jsonBytes []byte) (*DirectiveMap, error) {
 // Config returns (in-order) whether the directive is present, and if it is present
 // then whether it is a streaming (standard IO) or batch (file IO) configuration
 func (dm *DirectiveMap) Config(name string) (bool, bool) {
-	streaming, present := dm.directives[name]
-	return present, streaming
+	if directive, present := dm.directives[name]; present {
+		return true, directive.Streaming
+	}
+	return false, false
+}
+
+// Parameters returns (in-order) the parameters defined for the directive, which
+// is empty but non-nil if it defines none, and whether the directive is present
+func (dm *DirectiveMap) Parameters(name string) ([]Parameter, bool) {
+	directive, present := dm.directives[name]
+	if !present {
+		return nil, false
+	}
+	parameters := make([]Parameter, len(directive.Parameters))
+	copy(parameters, directive.Parameters)
+	return parameters, true
 }
