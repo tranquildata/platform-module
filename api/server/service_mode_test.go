@@ -235,6 +235,51 @@ func Test_thatClosingInputRequiresARunningStreamingModule(t *testing.T) {
 	}
 }
 
+// startUncollectedStream sends input to a streaming module that, once released,
+// writes output and terminates without that output being collected.
+func startUncollectedStream(t *testing.T, apis *APIService, mux *http.ServeMux) {
+	t.Helper()
+	release := make(chan struct{})
+	apis.startFn = func(_ map[string]string, _ bool) (module.Module, error) {
+		return startFake(true, func(stdin io.Reader, stdout io.Writer) error {
+			bufio.NewReader(stdin).ReadString('\n') //nolint:errcheck
+			<-release
+			fmt.Fprintln(stdout, "late output")
+			return nil
+		}), nil
+	}
+	apis.waitTimeout = 0 //return without waiting for output
+	if code := callStatus(mux, http.MethodPut, "/", "go"); code != http.StatusOK {
+		t.Fatalf("unexpected status %d", code)
+	}
+	close(release)
+	select {
+	case <-apis.stream.done:
+	case <-time.After(time.Second):
+		t.Fatal("module did not terminate")
+	}
+}
+
+func Test_thatStreamingWaitsForOutputCollection(t *testing.T) {
+	apis, mux := testService(t, true, nil)
+	startUncollectedStream(t, apis, mux)
+	//the module has terminated, but its output hasn't been collected
+	expectShutdown(t, apis, false)
+	if code, resp := call(t, mux, http.MethodGet, "/", ""); code != http.StatusOK {
+		t.Fatalf("unexpected status %d", code)
+	} else if out := string(resp.Outputs[""]); out != "late output\n" {
+		t.Errorf("unexpected output %q", out)
+	}
+	expectShutdown(t, apis, true)
+}
+
+func Test_thatUncollectedStreamingOutputTimesOut(t *testing.T) {
+	apis, mux := testService(t, true, nil)
+	apis.collectionTimeout = 200 * time.Millisecond
+	startUncollectedStream(t, apis, mux)
+	expectShutdown(t, apis, true)
+}
+
 func Test_thatStreamingReportsModuleFailure(t *testing.T) {
 	_, mux := testService(t, true, func(stdin io.Reader, stdout io.Writer) error {
 		bufio.NewReader(stdin).ReadString('\n') //nolint:errcheck
@@ -322,6 +367,90 @@ func Test_thatBatchReturnsAllOutputWithoutPaging(t *testing.T) {
 	} else if resp.CursorOffset != 0 {
 		t.Errorf("unexpected cursor offset %d", resp.CursorOffset)
 	}
+}
+
+func Test_thatAsyncBatchShutsDownAfterFinalPage(t *testing.T) {
+	release := make(chan struct{})
+	var apis *APIService
+	apis, mux := testService(t, false, func(_ io.Reader, _ io.Writer) error {
+		<-release
+		for _, name := range []string{"a", "b", "c"} {
+			if err := os.WriteFile(path.Join(apis.outputDirectory, name), []byte("output "+name), 0666); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	apis.maximumOutputSize = 1 //one file per page
+	if code := callStatus(mux, http.MethodPut, "/async?runId=1", "{}"); code != http.StatusOK {
+		t.Fatalf("start: unexpected status %d", code)
+	}
+	//still running, so the caller is told to retry
+	if code := callStatus(mux, http.MethodGet, "/async?runId=1", ""); code != http.StatusGatewayTimeout {
+		t.Errorf("while running: unexpected status %d", code)
+	}
+	expectShutdown(t, apis, false)
+
+	close(release)
+	collected := map[string]bool{}
+	for page := 1; page <= 3; page++ {
+		code, resp := call(t, mux, http.MethodGet, "/async?runId=1", "")
+		if code != http.StatusOK {
+			t.Fatalf("page %d: unexpected status %d", page, code)
+		}
+		for name := range resp.Outputs {
+			collected[name] = true
+		}
+		if page < 3 {
+			if resp.CursorOffset == 0 {
+				t.Fatalf("page %d: output ended early", page)
+			}
+			expectShutdown(t, apis, false)
+		} else if resp.CursorOffset != 0 {
+			t.Errorf("final page: unexpected cursor offset %d", resp.CursorOffset)
+		}
+	}
+	if len(collected) != 3 {
+		t.Errorf("expected 3 outputs, got %v", collected)
+	}
+	expectShutdown(t, apis, true)
+}
+
+func Test_thatAsyncBatchShutsDownWithoutOutput(t *testing.T) {
+	apis, mux := testService(t, false, func(_ io.Reader, _ io.Writer) error {
+		return nil
+	})
+	if code := callStatus(mux, http.MethodPut, "/async?runId=1", "{}"); code != http.StatusOK {
+		t.Fatalf("start: unexpected status %d", code)
+	}
+	if code := callStatus(mux, http.MethodGet, "/async?runId=1", ""); code != http.StatusNoContent {
+		t.Errorf("unexpected status %d", code)
+	}
+	expectShutdown(t, apis, true)
+}
+
+func Test_thatAsyncBatchShutsDownAfterReportingFailure(t *testing.T) {
+	apis, mux := testService(t, false, func(_ io.Reader, _ io.Writer) error {
+		return fmt.Errorf("exit status 1")
+	})
+	if code := callStatus(mux, http.MethodPut, "/async?runId=1", "{}"); code != http.StatusOK {
+		t.Fatalf("start: unexpected status %d", code)
+	}
+	if code := callStatus(mux, http.MethodGet, "/async?runId=1", ""); code != http.StatusInternalServerError {
+		t.Errorf("unexpected status %d", code)
+	}
+	expectShutdown(t, apis, true)
+}
+
+func Test_thatUncollectedAsyncOutputTimesOut(t *testing.T) {
+	apis, mux := testService(t, false, func(_ io.Reader, _ io.Writer) error {
+		return nil
+	})
+	apis.collectionTimeout = 200 * time.Millisecond
+	if code := callStatus(mux, http.MethodPut, "/async?runId=1", "{}"); code != http.StatusOK {
+		t.Fatalf("start: unexpected status %d", code)
+	}
+	expectShutdown(t, apis, true)
 }
 
 func Test_thatBatchRejectsInputAfterStart(t *testing.T) {
