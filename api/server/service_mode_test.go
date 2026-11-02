@@ -183,6 +183,7 @@ func Test_thatNoDirectiveOnlyDescribesDirectives(t *testing.T) {
 		{http.MethodGet, "/"},
 		{http.MethodDelete, "/"},
 		{http.MethodOptions, "/async"},
+		{http.MethodPut, "/parameters"},
 		{http.MethodPut, "/async?runId=1"},
 		{http.MethodGet, "/async?runId=1"},
 	}
@@ -192,6 +193,77 @@ func Test_thatNoDirectiveOnlyDescribesDirectives(t *testing.T) {
 		}
 	}
 	expectShutdown(t, apis, false)
+}
+
+func putParameters(mux *http.ServeMux, contentType string, body string) int {
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPut, "/parameters", strings.NewReader(body))
+	if contentType != "" {
+		r.Header.Set("Content-Type", contentType)
+	}
+	mux.ServeHTTP(w, r)
+	return w.Code
+}
+
+func Test_thatRuntimeParametersAreStaged(t *testing.T) {
+	for _, streaming := range []bool{true, false} {
+		apis, mux := testService(t, streaming, nil)
+		//the input directory is created if it doesn't exist yet
+		apis.inputDirectory = path.Join(apis.inputDirectory, "input")
+		if code := putParameters(mux, "text/csv", "name,value\nfirst,1\n"); code != http.StatusOK {
+			t.Fatalf("unexpected status %d", code)
+		}
+		if code := putParameters(mux, "application/csv", "name,value\nsecond,2\n"); code != http.StatusOK {
+			t.Fatalf("unexpected status %d", code)
+		}
+		//a later call replaces the earlier parameters, and content isn't checked
+		if code := putParameters(mux, "text/csv; charset=utf-8", "anything at all"); code != http.StatusOK {
+			t.Fatalf("unexpected status %d", code)
+		}
+		if data, err := os.ReadFile(path.Join(apis.inputDirectory, ParametersFilename)); err != nil {
+			t.Fatal(err)
+		} else if string(data) != "anything at all" {
+			t.Errorf("unexpected parameters %q", data)
+		}
+	}
+}
+
+func Test_thatInvalidRuntimeParametersAreRejected(t *testing.T) {
+	apis, mux := testService(t, false, nil)
+	cases := []struct {
+		description string
+		contentType string
+		body        string
+		status      int
+	}{
+		{"empty body", "text/csv", "", http.StatusBadRequest},
+		{"missing content type", "", "a,b\n", http.StatusUnsupportedMediaType},
+		{"wrong content type", "application/json", "a,b\n", http.StatusUnsupportedMediaType},
+		{"malformed content type", "text/csv;;", "a,b\n", http.StatusUnsupportedMediaType},
+	}
+	for _, c := range cases {
+		if code := putParameters(mux, c.contentType, c.body); code != c.status {
+			t.Errorf("%s: expected %d, got %d", c.description, c.status, code)
+		}
+	}
+	if _, err := os.Stat(path.Join(apis.inputDirectory, ParametersFilename)); !os.IsNotExist(err) {
+		t.Errorf("parameters file should not exist: %v", err)
+	}
+}
+
+func Test_thatRuntimeParametersMustPrecedeModuleStart(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	_, mux := testService(t, false, func(_ io.Reader, _ io.Writer) error {
+		<-release
+		return nil
+	})
+	if code := callStatus(mux, http.MethodPut, "/async?runId=1", "{}"); code != http.StatusOK {
+		t.Fatalf("start: unexpected status %d", code)
+	}
+	if code := putParameters(mux, "text/csv", "a,b\n"); code != http.StatusConflict {
+		t.Errorf("unexpected status %d", code)
+	}
 }
 
 func Test_thatParametersAreReturned(t *testing.T) {
