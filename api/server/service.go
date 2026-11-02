@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"os"
 	"path"
@@ -28,6 +29,7 @@ const OutputDirectoryPath = "/moduleio/output"
 const RunIdParamName = "runId"
 const UploadOnlyParamName = "uploadOnly"
 const DirectiveParamName = "directive"
+const ParametersFilename = "parameters.csv"
 
 const DefaultMaximumOutputSize = 64 * 1024 * 1024 //64 MB
 const DefaultCollectionTimeout = 20 * time.Minute
@@ -193,7 +195,8 @@ func (apis *APIService) shutdownServer(httpServer *http.Server) error {
 func (apis *APIService) registerHTTPEndpoints(mux *http.ServeMux) {
 	mux.HandleFunc("HEAD /{$}", apis.status)
 	mux.HandleFunc("OPTIONS /", apis.serviceInfo)
-	mux.HandleFunc("GET /parameters", apis.parameters)
+	mux.HandleFunc("GET /parameters", apis.getDefaultParameters)
+	mux.HandleFunc("PUT /parameters", apis.requireDirective(apis.setRuntimeParameters))
 	mux.HandleFunc("PUT /", apis.requireDirective(apis.inputData))
 	mux.HandleFunc("GET /{$}", apis.requireDirective(apis.streamOutput))      //streaming only, collects any output produced since the last call
 	mux.HandleFunc("DELETE /{$}", apis.requireDirective(apis.closeInput))     //streaming only, closes standard-in and collects any output
@@ -236,8 +239,8 @@ func (apis *APIService) serviceInfo(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// parameters returns the parameters defined for the directive named in the query.
-func (apis *APIService) parameters(w http.ResponseWriter, r *http.Request) {
+// getDefaultParameters returns the parameters defined for the directive named in the query.
+func (apis *APIService) getDefaultParameters(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get(DirectiveParamName)
 	if name == "" {
 		http.Error(w, fmt.Sprintf("missing %s query parameter", DirectiveParamName), http.StatusBadRequest)
@@ -253,6 +256,39 @@ func (apis *APIService) parameters(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(responseBytes) //nolint:errcheck
+	}
+}
+
+// setRuntimeParameters is used by both direct and async paths to set the active parameters.
+// The CSV body is written, unchecked, to the parameters file in the input directory, so
+// it must be called before the module starts. Calling it is optional.
+func (apis *APIService) setRuntimeParameters(w http.ResponseWriter, r *http.Request) {
+	if mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil ||
+		(mediaType != "text/csv" && mediaType != "application/csv") {
+		http.Error(w, "parameters must have content type text/csv or application/csv", http.StatusUnsupportedMediaType)
+		return
+	}
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "failed to read parameters: "+err.Error(), http.StatusBadRequest)
+		return
+	} else if len(bodyBytes) == 0 {
+		http.Error(w, "parameters must not be empty", http.StatusBadRequest)
+		return
+	}
+
+	apis.moduleLock.Lock()
+	defer apis.moduleLock.Unlock()
+	if apis.activeModule != nil {
+		http.Error(w, "module is already running; parameters must be set before the module starts", http.StatusConflict)
+		return
+	}
+	if err = ensureDirectory(apis.inputDirectory); err != nil {
+		http.Error(w, "failed to create input directory: "+err.Error(), http.StatusInternalServerError)
+	} else if err = os.WriteFile(path.Join(apis.inputDirectory, ParametersFilename), bodyBytes, 0666); err != nil {
+		http.Error(w, "failed to write parameters: "+err.Error(), http.StatusInternalServerError)
+	} else {
+		w.WriteHeader(http.StatusOK)
 	}
 }
 
@@ -623,15 +659,20 @@ func handleFileInput(inputBytes []byte, inputDirectory string) error {
 	if err := json.Unmarshal(inputBytes, &fileMapping); err != nil {
 		return err
 	}
-	if info, err := os.Stat(inputDirectory); err != nil || !info.IsDir() {
-		if err = os.Mkdir(inputDirectory, 0777); err != nil {
-			return err
-		}
+	if err := ensureDirectory(inputDirectory); err != nil {
+		return err
 	}
 	for filename, data := range fileMapping {
 		if err := os.WriteFile(path.Join(inputDirectory, filename), data, 0666); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func ensureDirectory(directory string) error {
+	if info, err := os.Stat(directory); err != nil || !info.IsDir() {
+		return os.Mkdir(directory, 0777)
 	}
 	return nil
 }
